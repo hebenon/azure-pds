@@ -1,0 +1,733 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "_generator": {
+      "name": "bicep",
+      "version": "0.38.33.27573",
+      "templateHash": "10404824586784760043"
+    }
+  },
+  "parameters": {
+    "namePrefix": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 12,
+      "metadata": {
+        "description": "Prefix applied to most resource names."
+      }
+    },
+    "location": {
+      "type": "string",
+      "defaultValue": "[resourceGroup().location]",
+      "metadata": {
+        "description": "Azure region for all resources."
+      }
+    },
+    "pdsHostname": {
+      "type": "string",
+      "minLength": 4,
+      "maxLength": 253,
+      "metadata": {
+        "description": "Fully qualified hostname clients use to reach the PDS (e.g. pds.example.com)."
+      }
+    },
+    "pdsImageTag": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "metadata": {
+        "description": "Container image tag for ghcr.io/bluesky-social/pds (e.g. 0.4)."
+      }
+    },
+    "caddyImage": {
+      "type": "string",
+      "defaultValue": "caddy:2",
+      "metadata": {
+        "description": "Optional override for the Caddy container image."
+      }
+    },
+    "pdsCpu": {
+      "type": "string",
+      "defaultValue": "0.5",
+      "metadata": {
+        "description": "CPU request for the PDS container in cores."
+      }
+    },
+    "pdsMemory": {
+      "type": "string",
+      "defaultValue": "1Gi",
+      "metadata": {
+        "description": "Memory request for the PDS container."
+      }
+    },
+    "caddyCpu": {
+      "type": "string",
+      "defaultValue": "0.25",
+      "metadata": {
+        "description": "CPU request for the Caddy container in cores."
+      }
+    },
+    "caddyMemory": {
+      "type": "string",
+      "defaultValue": "0.5Gi",
+      "metadata": {
+        "description": "Memory request for the Caddy container."
+      }
+    },
+    "minReplicas": {
+      "type": "int",
+      "defaultValue": 1,
+      "metadata": {
+        "description": "Minimum number of replicas the container app should maintain."
+      }
+    },
+    "maxReplicas": {
+      "type": "int",
+      "defaultValue": 2,
+      "metadata": {
+        "description": "Maximum number of replicas the container app may scale to."
+      }
+    },
+    "pdsJwtSecretName": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 127,
+      "metadata": {
+        "description": "Name of the Key Vault secret containing the PDS JWT secret."
+      }
+    },
+    "pdsAdminPasswordSecretName": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 127,
+      "metadata": {
+        "description": "Name of the Key Vault secret containing the PDS admin password."
+      }
+    },
+    "pdsPlcRotationKeySecretName": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 127,
+      "metadata": {
+        "description": "Name of the Key Vault secret containing the PLC rotation key (hex)."
+      }
+    },
+    "smtpSecretName": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 127,
+      "metadata": {
+        "description": "Name of the Key Vault secret containing the SMTP connection string or password."
+      }
+    },
+    "emailFromAddress": {
+      "type": "string",
+      "minLength": 5,
+      "maxLength": 320,
+      "metadata": {
+        "description": "From address to use when PDS sends email."
+      }
+    },
+    "adminObjectId": {
+      "type": "string",
+      "minLength": 36,
+      "maxLength": 36,
+      "metadata": {
+        "description": "Object ID for an administrator that should have full access to the Key Vault."
+      }
+    },
+    "fileShareQuotaGiB": {
+      "type": "int",
+      "defaultValue": 256,
+      "minValue": 1,
+      "maxValue": 102400,
+      "metadata": {
+        "description": "Quota in GiB allocated to the Azure Files share that stores PDS state."
+      }
+    },
+    "dnsZoneName": {
+      "type": "string",
+      "defaultValue": "",
+      "maxLength": 253,
+      "metadata": {
+        "description": "Optional DNS zone name (e.g. example.com). Leave empty to skip DNS record creation."
+      }
+    },
+    "dnsRecordName": {
+      "type": "string",
+      "defaultValue": "pds",
+      "minLength": 1,
+      "maxLength": 63,
+      "metadata": {
+        "description": "Optional relative record for the container app within the DNS zone (e.g. pds). Ignored when dnsZoneName is empty."
+      }
+    },
+    "logAnalyticsRetentionDays": {
+      "type": "int",
+      "defaultValue": 30,
+      "minValue": 7,
+      "maxValue": 730,
+      "metadata": {
+        "description": "Retention in days for Log Analytics data."
+      }
+    },
+    "maintenanceWindow": {
+      "type": "string",
+      "defaultValue": "Sun 02:00",
+      "minLength": 7,
+      "maxLength": 10,
+      "metadata": {
+        "description": "Maintenance window for backup operations (e.g., \"Sun 02:00\")."
+      }
+    },
+    "backupRetentionDays": {
+      "type": "int",
+      "defaultValue": 30,
+      "minValue": 7,
+      "maxValue": 365,
+      "metadata": {
+        "description": "Retention in days for Azure Files snapshots."
+      }
+    },
+    "baseDateTime": {
+      "type": "string",
+      "defaultValue": "[utcNow('yyyy-MM-dd')]",
+      "metadata": {
+        "description": "Base date for schedule calculation."
+      }
+    }
+  },
+  "variables": {
+    "tenantId": "[subscription().tenantId]",
+    "pdsImage": "[format('ghcr.io/bluesky-social/pds:{0}', parameters('pdsImageTag'))]",
+    "cleanedNamePrefix": "[replace(format('{0}{1}', parameters('namePrefix'), uniqueString(resourceGroup().id)), '-', '')]",
+    "storageAccountName": "[toLower(substring(variables('cleanedNamePrefix'), 0, min(length(variables('cleanedNamePrefix')), 24)))]",
+    "containerAppName": "[format('{0}-pds-app', parameters('namePrefix'))]",
+    "keyVaultName": "[format('{0}-kv', parameters('namePrefix'))]",
+    "logAnalyticsName": "[format('{0}-law', parameters('namePrefix'))]",
+    "managedEnvName": "[format('{0}-cae', parameters('namePrefix'))]",
+    "automationAccountName": "[format('{0}-auto', parameters('namePrefix'))]",
+    "runbookName": "BackupPdsFiles",
+    "scheduleName": "DailyBackupSchedule",
+    "fileShareName": "pds",
+    "storageShareStorageName": "pdsfiles",
+    "storageAccountKeySecretName": "storage-account-key",
+    "backupRunbookScript": "param(\n    [Parameter(Mandatory=$true)]\n    [string]$StorageAccountName,\n    \n    [Parameter(Mandatory=$true)]\n    [string]$ShareName,\n    \n    [Parameter(Mandatory=$true)]\n    [int]$RetentionDays,\n    \n    [Parameter(Mandatory=$true)]\n    [string]$ResourceGroupName\n)\n\nWrite-Output \"Starting backup process for storage account: $StorageAccountName, share: $ShareName\"\n\ntry {\n    # Connect using managed identity\n    Connect-AzAccount -Identity\n    \n    # Get storage account context\n    $storageAccount = Get-AzStorageAccount -ResourceGroupName $ResourceGroupName -Name $StorageAccountName\n    $ctx = $storageAccount.Context\n    \n    # Create snapshot with timestamp\n    $timestamp = Get-Date -Format \"yyyyMMdd-HHmmss\"\n    $snapshotName = \"backup-$timestamp\"\n    \n    Write-Output \"Creating snapshot: $snapshotName\"\n    $snapshot = New-AzStorageShare -Name $ShareName -Context $ctx -Snapshot\n    \n    Write-Output \"Snapshot created successfully: $($snapshot.SnapshotTime)\"\n    \n    # Clean up old snapshots\n    Write-Output \"Cleaning up snapshots older than $RetentionDays days\"\n    $cutoffDate = (Get-Date).AddDays(-$RetentionDays)\n    \n    $allSnapshots = Get-AzStorageShare -Name $ShareName -Context $ctx -IncludeSnapshot\n    $oldSnapshots = $allSnapshots | Where-Object { $_.IsSnapshot -and $_.SnapshotTime -lt $cutoffDate }\n    \n    foreach ($oldSnapshot in $oldSnapshots) {\n        Write-Output \"Removing old snapshot from: $($oldSnapshot.SnapshotTime)\"\n        Remove-AzStorageShare -Share $oldSnapshot -Force\n    }\n    \n    Write-Output \"Backup process completed successfully\"\n}\ncatch {\n    Write-Error \"Backup failed: $($_.Exception.Message)\"\n    throw\n}\n"
+  },
+  "resources": [
+    {
+      "type": "Microsoft.OperationalInsights/workspaces",
+      "apiVersion": "2022-10-01",
+      "name": "[variables('logAnalyticsName')]",
+      "location": "[parameters('location')]",
+      "properties": {
+        "retentionInDays": "[parameters('logAnalyticsRetentionDays')]",
+        "features": {
+          "enableLogAccessUsingOnlyResourcePermissions": true
+        },
+        "sku": {
+          "name": "PerGB2018"
+        }
+      }
+    },
+    {
+      "type": "Microsoft.App/managedEnvironments",
+      "apiVersion": "2023-05-01",
+      "name": "[variables('managedEnvName')]",
+      "location": "[parameters('location')]",
+      "properties": {
+        "appLogsConfiguration": {
+          "destination": "log-analytics",
+          "logAnalyticsConfiguration": {
+            "customerId": "[reference(resourceId('Microsoft.OperationalInsights/workspaces', variables('logAnalyticsName')), '2022-10-01').customerId]",
+            "sharedKey": "[listKeys(resourceId('Microsoft.OperationalInsights/workspaces', variables('logAnalyticsName')), '2020-08-01').primarySharedKey]"
+          }
+        }
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.OperationalInsights/workspaces', variables('logAnalyticsName'))]"
+      ]
+    },
+    {
+      "type": "Microsoft.Storage/storageAccounts",
+      "apiVersion": "2022-09-01",
+      "name": "[variables('storageAccountName')]",
+      "location": "[parameters('location')]",
+      "sku": {
+        "name": "Standard_LRS"
+      },
+      "kind": "StorageV2",
+      "properties": {
+        "accessTier": "Hot",
+        "minimumTlsVersion": "TLS1_2",
+        "supportsHttpsTrafficOnly": true,
+        "allowBlobPublicAccess": false,
+        "allowSharedKeyAccess": true
+      }
+    },
+    {
+      "type": "Microsoft.Storage/storageAccounts/fileServices/shares",
+      "apiVersion": "2022-09-01",
+      "name": "[format('{0}/default/{1}', variables('storageAccountName'), variables('fileShareName'))]",
+      "properties": {
+        "shareQuota": "[parameters('fileShareQuotaGiB')]",
+        "enabledProtocols": "SMB"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Storage/storageAccounts', variables('storageAccountName'))]"
+      ]
+    },
+    {
+      "type": "Microsoft.KeyVault/vaults",
+      "apiVersion": "2023-07-01",
+      "name": "[variables('keyVaultName')]",
+      "location": "[parameters('location')]",
+      "properties": {
+        "tenantId": "[variables('tenantId')]",
+        "sku": {
+          "name": "standard",
+          "family": "A"
+        },
+        "enablePurgeProtection": true,
+        "enabledForTemplateDeployment": true,
+        "accessPolicies": [
+          {
+            "tenantId": "[variables('tenantId')]",
+            "objectId": "[parameters('adminObjectId')]",
+            "permissions": {
+              "secrets": [
+                "get",
+                "list",
+                "set",
+                "delete",
+                "recover",
+                "backup",
+                "restore"
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.App/containerApps",
+      "apiVersion": "2023-05-01",
+      "name": "[variables('containerAppName')]",
+      "location": "[parameters('location')]",
+      "identity": {
+        "type": "SystemAssigned"
+      },
+      "properties": {
+        "managedEnvironmentId": "[resourceId('Microsoft.App/managedEnvironments', variables('managedEnvName'))]",
+        "configuration": {
+          "activeRevisionsMode": "Single",
+          "ingress": {
+            "external": true,
+            "targetPort": 443,
+            "allowInsecure": true,
+            "transport": "auto",
+            "traffic": [
+              {
+                "latestRevision": true,
+                "weight": 100
+              }
+            ]
+          },
+          "secrets": [
+            {
+              "name": "storage-key",
+              "value": "[listKeys(resourceId('Microsoft.Storage/storageAccounts', variables('storageAccountName')), '2022-09-01').keys[0].value]"
+            },
+            {
+              "name": "pds-jwt-secret",
+              "keyVaultUrl": "[format('{0}secrets/{1}', reference(resourceId('Microsoft.KeyVault/vaults', variables('keyVaultName')), '2023-07-01').vaultUri, parameters('pdsJwtSecretName'))]"
+            },
+            {
+              "name": "pds-admin-password",
+              "keyVaultUrl": "[format('{0}secrets/{1}', reference(resourceId('Microsoft.KeyVault/vaults', variables('keyVaultName')), '2023-07-01').vaultUri, parameters('pdsAdminPasswordSecretName'))]"
+            },
+            {
+              "name": "pds-plc-key",
+              "keyVaultUrl": "[format('{0}secrets/{1}', reference(resourceId('Microsoft.KeyVault/vaults', variables('keyVaultName')), '2023-07-01').vaultUri, parameters('pdsPlcRotationKeySecretName'))]"
+            },
+            {
+              "name": "pds-smtp-secret",
+              "keyVaultUrl": "[format('{0}secrets/{1}', reference(resourceId('Microsoft.KeyVault/vaults', variables('keyVaultName')), '2023-07-01').vaultUri, parameters('smtpSecretName'))]"
+            }
+          ],
+          "storage": [
+            {
+              "name": "[variables('storageShareStorageName')]",
+              "azureFile": {
+                "accountName": "[variables('storageAccountName')]",
+                "shareName": "[variables('fileShareName')]",
+                "accessMode": "ReadWrite",
+                "accountKeySecretRef": "storage-key"
+              }
+            }
+          ]
+        },
+        "template": {
+          "revisionSuffix": "[toLower(format('r{0}', uniqueString(variables('pdsImage'))))]",
+          "containers": [
+            {
+              "name": "caddy",
+              "image": "[parameters('caddyImage')]",
+              "resources": {
+                "requests": {
+                  "cpu": "[parameters('caddyCpu')]",
+                  "memory": "[parameters('caddyMemory')]"
+                }
+              },
+              "volumeMounts": [
+                {
+                  "name": "[variables('storageShareStorageName')]",
+                  "mountPath": "/pds"
+                }
+              ],
+              "ports": [
+                {
+                  "port": 80
+                },
+                {
+                  "port": 443
+                }
+              ],
+              "env": [
+                {
+                  "name": "ACME_AGREE",
+                  "value": "true"
+                },
+                {
+                  "name": "PDS_HOSTNAME",
+                  "value": "[parameters('pdsHostname')]"
+                }
+              ]
+            },
+            {
+              "name": "pds",
+              "image": "[variables('pdsImage')]",
+              "resources": {
+                "requests": {
+                  "cpu": "[parameters('pdsCpu')]",
+                  "memory": "[parameters('pdsMemory')]"
+                }
+              },
+              "volumeMounts": [
+                {
+                  "name": "[variables('storageShareStorageName')]",
+                  "mountPath": "/pds"
+                }
+              ],
+              "env": [
+                {
+                  "name": "PDS_PORT",
+                  "value": "2583"
+                },
+                {
+                  "name": "PDS_HOSTNAME",
+                  "value": "[parameters('pdsHostname')]"
+                },
+                {
+                  "name": "PDS_DATA_DIRECTORY",
+                  "value": "/pds"
+                },
+                {
+                  "name": "PDS_ACTOR_STORE_DIRECTORY",
+                  "value": "/pds/actors"
+                },
+                {
+                  "name": "PDS_BLOBSTORE_DISK_LOCATION",
+                  "value": "/pds/blobs"
+                },
+                {
+                  "name": "PDS_BLOBSTORE_DISK_TMP_LOCATION",
+                  "value": "/pds/blobs/tmp"
+                },
+                {
+                  "name": "PDS_SQLITE_DISABLE_WAL_AUTO_CHECKPOINT",
+                  "value": "true"
+                },
+                {
+                  "name": "PDS_EMAIL_FROM_ADDRESS",
+                  "value": "[parameters('emailFromAddress')]"
+                },
+                {
+                  "name": "PDS_JWT_SECRET",
+                  "secretRef": "pds-jwt-secret"
+                },
+                {
+                  "name": "PDS_ADMIN_PASSWORD",
+                  "secretRef": "pds-admin-password"
+                },
+                {
+                  "name": "PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX",
+                  "secretRef": "pds-plc-key"
+                },
+                {
+                  "name": "PDS_EMAIL_SMTP_URL",
+                  "secretRef": "pds-smtp-secret"
+                }
+              ]
+            }
+          ],
+          "scale": {
+            "minReplicas": "[parameters('minReplicas')]",
+            "maxReplicas": "[parameters('maxReplicas')]"
+          },
+          "volumes": [
+            {
+              "name": "[variables('storageShareStorageName')]",
+              "storageType": "AzureFile",
+              "storageName": "[variables('storageShareStorageName')]"
+            }
+          ]
+        }
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.KeyVault/vaults', variables('keyVaultName'))]",
+        "[resourceId('Microsoft.App/managedEnvironments', variables('managedEnvName'))]",
+        "[resourceId('Microsoft.Storage/storageAccounts', variables('storageAccountName'))]"
+      ]
+    },
+    {
+      "type": "Microsoft.KeyVault/vaults/accessPolicies",
+      "apiVersion": "2023-07-01",
+      "name": "[format('{0}/{1}', variables('keyVaultName'), 'add')]",
+      "properties": {
+        "accessPolicies": [
+          {
+            "tenantId": "[variables('tenantId')]",
+            "objectId": "[reference(resourceId('Microsoft.App/containerApps', variables('containerAppName')), '2023-05-01', 'full').identity.principalId]",
+            "permissions": {
+              "secrets": [
+                "get",
+                "list"
+              ]
+            }
+          }
+        ]
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.App/containerApps', variables('containerAppName'))]",
+        "[resourceId('Microsoft.KeyVault/vaults', variables('keyVaultName'))]"
+      ]
+    },
+    {
+      "type": "Microsoft.Insights/diagnosticSettings",
+      "apiVersion": "2021-05-01-preview",
+      "scope": "[format('Microsoft.App/containerApps/{0}', variables('containerAppName'))]",
+      "name": "[format('{0}-logs', variables('containerAppName'))]",
+      "properties": {
+        "workspaceId": "[resourceId('Microsoft.OperationalInsights/workspaces', variables('logAnalyticsName'))]",
+        "logs": [
+          {
+            "category": "ContainerAppConsoleLogs",
+            "enabled": true
+          },
+          {
+            "category": "SystemLogs",
+            "enabled": true
+          }
+        ]
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.App/containerApps', variables('containerAppName'))]",
+        "[resourceId('Microsoft.OperationalInsights/workspaces', variables('logAnalyticsName'))]"
+      ]
+    },
+    {
+      "type": "Microsoft.Automation/automationAccounts",
+      "apiVersion": "2023-11-01",
+      "name": "[variables('automationAccountName')]",
+      "location": "[parameters('location')]",
+      "identity": {
+        "type": "SystemAssigned"
+      },
+      "properties": {
+        "sku": {
+          "name": "Basic"
+        },
+        "encryption": {
+          "keySource": "Microsoft.Automation"
+        }
+      }
+    },
+    {
+      "type": "Microsoft.Automation/automationAccounts/runbooks",
+      "apiVersion": "2023-11-01",
+      "name": "[format('{0}/{1}', variables('automationAccountName'), variables('runbookName'))]",
+      "properties": {
+        "runbookType": "PowerShell",
+        "description": "Creates daily snapshots of the PDS Azure Files share and manages retention",
+        "publishContentLink": {
+          "uri": "[format('data:text/plain;base64,{0}', base64(variables('backupRunbookScript')))]"
+        }
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Automation/automationAccounts', variables('automationAccountName'))]"
+      ]
+    },
+    {
+      "type": "Microsoft.Automation/automationAccounts/schedules",
+      "apiVersion": "2023-11-01",
+      "name": "[format('{0}/{1}', variables('automationAccountName'), variables('scheduleName'))]",
+      "properties": {
+        "frequency": "Week",
+        "interval": 1,
+        "startTime": "[format('{0}T{1}:00.000Z', parameters('baseDateTime'), split(parameters('maintenanceWindow'), ' ')[1])]",
+        "timeZone": "UTC",
+        "advancedSchedule": {
+          "weekDays": [
+            "[split(parameters('maintenanceWindow'), ' ')[0]]"
+          ]
+        },
+        "description": "Daily backup schedule for PDS files"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Automation/automationAccounts', variables('automationAccountName'))]"
+      ]
+    },
+    {
+      "type": "Microsoft.Automation/automationAccounts/jobSchedules",
+      "apiVersion": "2023-11-01",
+      "name": "[format('{0}/{1}', variables('automationAccountName'), guid(resourceId('Microsoft.Automation/automationAccounts', variables('automationAccountName')), resourceId('Microsoft.Automation/automationAccounts/runbooks', variables('automationAccountName'), variables('runbookName')), resourceId('Microsoft.Automation/automationAccounts/schedules', variables('automationAccountName'), variables('scheduleName'))))]",
+      "properties": {
+        "runbook": {
+          "name": "[variables('runbookName')]"
+        },
+        "schedule": {
+          "name": "[variables('scheduleName')]"
+        },
+        "parameters": {
+          "StorageAccountName": "[variables('storageAccountName')]",
+          "ShareName": "[variables('fileShareName')]",
+          "RetentionDays": "[string(parameters('backupRetentionDays'))]",
+          "ResourceGroupName": "[resourceGroup().name]"
+        }
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Automation/automationAccounts', variables('automationAccountName'))]",
+        "[resourceId('Microsoft.Automation/automationAccounts/runbooks', variables('automationAccountName'), variables('runbookName'))]",
+        "[resourceId('Microsoft.Automation/automationAccounts/schedules', variables('automationAccountName'), variables('scheduleName'))]",
+        "[resourceId('Microsoft.Storage/storageAccounts', variables('storageAccountName'))]"
+      ]
+    },
+    {
+      "type": "Microsoft.Authorization/roleAssignments",
+      "apiVersion": "2022-04-01",
+      "scope": "[format('Microsoft.Storage/storageAccounts/{0}', variables('storageAccountName'))]",
+      "name": "[guid(resourceId('Microsoft.Storage/storageAccounts', variables('storageAccountName')), resourceId('Microsoft.Automation/automationAccounts', variables('automationAccountName')), 'ba92f5b4-2d11-453d-a403-e96b0029c9fe')]",
+      "properties": {
+        "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'ba92f5b4-2d11-453d-a403-e96b0029c9fe')]",
+        "principalId": "[reference(resourceId('Microsoft.Automation/automationAccounts', variables('automationAccountName')), '2023-11-01', 'full').identity.principalId]",
+        "principalType": "ServicePrincipal"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Automation/automationAccounts', variables('automationAccountName'))]",
+        "[resourceId('Microsoft.Storage/storageAccounts', variables('storageAccountName'))]"
+      ]
+    },
+    {
+      "type": "Microsoft.KeyVault/vaults/secrets",
+      "apiVersion": "2023-07-01",
+      "name": "[format('{0}/{1}', variables('keyVaultName'), variables('storageAccountKeySecretName'))]",
+      "properties": {
+        "value": "[listKeys(resourceId('Microsoft.Storage/storageAccounts', variables('storageAccountName')), '2022-09-01').keys[0].value]"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.KeyVault/vaults', variables('keyVaultName'))]",
+        "[resourceId('Microsoft.Storage/storageAccounts', variables('storageAccountName'))]"
+      ]
+    },
+    {
+      "type": "Microsoft.Authorization/roleAssignments",
+      "apiVersion": "2022-04-01",
+      "scope": "[format('Microsoft.KeyVault/vaults/{0}', variables('keyVaultName'))]",
+      "name": "[guid(resourceId('Microsoft.KeyVault/vaults', variables('keyVaultName')), resourceId('Microsoft.Automation/automationAccounts', variables('automationAccountName')), '4633458b-17de-408a-b874-0445c86b69e6')]",
+      "properties": {
+        "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '4633458b-17de-408a-b874-0445c86b69e6')]",
+        "principalId": "[reference(resourceId('Microsoft.Automation/automationAccounts', variables('automationAccountName')), '2023-11-01', 'full').identity.principalId]",
+        "principalType": "ServicePrincipal"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Automation/automationAccounts', variables('automationAccountName'))]",
+        "[resourceId('Microsoft.KeyVault/vaults', variables('keyVaultName'))]"
+      ]
+    },
+    {
+      "condition": "[not(equals(parameters('dnsZoneName'), ''))]",
+      "type": "Microsoft.Network/dnsZones",
+      "apiVersion": "2023-07-01-preview",
+      "name": "[parameters('dnsZoneName')]",
+      "location": "global"
+    },
+    {
+      "condition": "[not(equals(parameters('dnsZoneName'), ''))]",
+      "type": "Microsoft.Network/dnsZones/CNAME",
+      "apiVersion": "2023-07-01-preview",
+      "name": "[format('{0}/{1}', parameters('dnsZoneName'), parameters('dnsRecordName'))]",
+      "properties": {
+        "TTL": 300,
+        "CNAMERecord": {
+          "cname": "[reference(resourceId('Microsoft.App/containerApps', variables('containerAppName')), '2023-05-01').configuration.ingress.fqdn]"
+        }
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.App/containerApps', variables('containerAppName'))]",
+        "[resourceId('Microsoft.Network/dnsZones', parameters('dnsZoneName'))]"
+      ]
+    },
+    {
+      "condition": "[not(equals(parameters('dnsZoneName'), ''))]",
+      "type": "Microsoft.Network/dnsZones/CNAME",
+      "apiVersion": "2023-07-01-preview",
+      "name": "[format('{0}/{1}', parameters('dnsZoneName'), format('*.{0}', parameters('dnsRecordName')))]",
+      "properties": {
+        "TTL": 300,
+        "CNAMERecord": {
+          "cname": "[reference(resourceId('Microsoft.App/containerApps', variables('containerAppName')), '2023-05-01').configuration.ingress.fqdn]"
+        }
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.App/containerApps', variables('containerAppName'))]",
+        "[resourceId('Microsoft.Network/dnsZones', parameters('dnsZoneName'))]"
+      ]
+    }
+  ],
+  "outputs": {
+    "containerAppName": {
+      "type": "string",
+      "value": "[variables('containerAppName')]"
+    },
+    "containerAppFqdn": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.App/containerApps', variables('containerAppName')), '2023-05-01').configuration.ingress.fqdn]"
+    },
+    "storageAccountId": {
+      "type": "string",
+      "value": "[resourceId('Microsoft.Storage/storageAccounts', variables('storageAccountName'))]"
+    },
+    "fileSharePath": {
+      "type": "string",
+      "value": "[format('{0}/default/{1}', variables('storageAccountName'), variables('fileShareName'))]"
+    },
+    "keyVaultUri": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.KeyVault/vaults', variables('keyVaultName')), '2023-07-01').vaultUri]"
+    },
+    "automationAccountName": {
+      "type": "string",
+      "value": "[variables('automationAccountName')]"
+    },
+    "automationRunbookId": {
+      "type": "string",
+      "value": "[resourceId('Microsoft.Automation/automationAccounts/runbooks', variables('automationAccountName'), variables('runbookName'))]"
+    },
+    "backupScheduleName": {
+      "type": "string",
+      "value": "[variables('scheduleName')]"
+    }
+  }
+}

@@ -1,13 +1,19 @@
 @description('Prefix applied to most resource names.')
+@minLength(3)
+@maxLength(12)
 param namePrefix string
 
 @description('Azure region for all resources.')
 param location string = resourceGroup().location
 
 @description('Fully qualified hostname clients use to reach the PDS (e.g. pds.example.com).')
+@minLength(4)
+@maxLength(253)
 param pdsHostname string
 
 @description('Container image tag for ghcr.io/bluesky-social/pds (e.g. 0.4).')
+@minLength(1)
+@maxLength(128)
 param pdsImageTag string
 
 @description('Optional override for the Caddy container image.')
@@ -32,44 +38,81 @@ param minReplicas int = 1
 param maxReplicas int = 2
 
 @description('Name of the Key Vault secret containing the PDS JWT secret.')
+@minLength(1)
+@maxLength(127)
 param pdsJwtSecretName string
 
 @description('Name of the Key Vault secret containing the PDS admin password.')
+@minLength(1)
+@maxLength(127)
 param pdsAdminPasswordSecretName string
 
 @description('Name of the Key Vault secret containing the PLC rotation key (hex).')
+@minLength(1)
+@maxLength(127)
 param pdsPlcRotationKeySecretName string
 
 @description('Name of the Key Vault secret containing the SMTP connection string or password.')
+@minLength(1)
+@maxLength(127)
 param smtpSecretName string
 
 @description('From address to use when PDS sends email.')
+@minLength(5)
+@maxLength(320)
 param emailFromAddress string
 
 @description('Object ID for an administrator that should have full access to the Key Vault.')
+@minLength(36)
+@maxLength(36)
 param adminObjectId string
 
 @description('Quota in GiB allocated to the Azure Files share that stores PDS state.')
+@minValue(1)
+@maxValue(102400)
 param fileShareQuotaGiB int = 256
 
 @description('Optional DNS zone name (e.g. example.com). Leave empty to skip DNS record creation.')
+@maxLength(253)
 param dnsZoneName string = ''
 
 @description('Optional relative record for the container app within the DNS zone (e.g. pds). Ignored when dnsZoneName is empty.')
+@minLength(1)
+@maxLength(63)
 param dnsRecordName string = 'pds'
 
 @description('Retention in days for Log Analytics data.')
+@minValue(7)
+@maxValue(730)
 param logAnalyticsRetentionDays int = 30
+
+@description('Maintenance window for backup operations (e.g., "Sun 02:00").')
+@minLength(7)
+@maxLength(10)
+param maintenanceWindow string = 'Sun 02:00'
+
+@description('Retention in days for Azure Files snapshots.')
+@minValue(7)
+@maxValue(365)
+param backupRetentionDays int = 30
+
+@description('Base date for schedule calculation.')
+param baseDateTime string = utcNow('yyyy-MM-dd')
 
 var tenantId = subscription().tenantId
 var pdsImage = 'ghcr.io/bluesky-social/pds:${pdsImageTag}'
-var storageAccountName = toLower(substring(replace('${namePrefix}${uniqueString(resourceGroup().id)}', '-', ''), 0, 24))
+var cleanedNamePrefix = replace('${namePrefix}${uniqueString(resourceGroup().id)}', '-', '')
+var storageAccountName = toLower(length(cleanedNamePrefix) > 24 ? substring(cleanedNamePrefix, 0, 24) : cleanedNamePrefix)
 var containerAppName = '${namePrefix}-pds-app'
 var keyVaultName = '${namePrefix}-kv'
 var logAnalyticsName = '${namePrefix}-law'
 var managedEnvName = '${namePrefix}-cae'
+var automationAccountName = '${namePrefix}-auto'
+var runbookName = 'BackupPdsFiles'
+var scheduleName = 'DailyBackupSchedule'
 var fileShareName = 'pds'
 var storageShareStorageName = 'pdsfiles'
+var storageAccountKeySecretName = 'storage-account-key'
 
 resource logAnalytics 'Microsoft.OperationalInsights/workspaces@2022-10-01' = {
   name: logAnalyticsName
@@ -79,9 +122,9 @@ resource logAnalytics 'Microsoft.OperationalInsights/workspaces@2022-10-01' = {
     features: {
       enableLogAccessUsingOnlyResourcePermissions: true
     }
-  }
-  sku: {
-    name: 'PerGB2018'
+    sku: {
+      name: 'PerGB2018'
+    }
   }
 }
 
@@ -179,7 +222,7 @@ resource containerApp 'Microsoft.App/containerApps@2023-05-01' = {
       secrets: [
         {
           name: 'storage-key'
-          value: listKeys(storageAccount.id, '2022-09-01').keys[0].value
+          value: storageAccount.listKeys().keys[0].value
         }
         {
           name: 'pds-jwt-secret'
@@ -330,7 +373,8 @@ resource containerApp 'Microsoft.App/containerApps@2023-05-01' = {
 }
 
 resource kvPolicyApp 'Microsoft.KeyVault/vaults/accessPolicies@2023-07-01' = {
-  name: '${keyVault.name}/add'
+  name: 'add'
+  parent: keyVault
   properties: {
     accessPolicies: [
       {
@@ -345,9 +389,6 @@ resource kvPolicyApp 'Microsoft.KeyVault/vaults/accessPolicies@2023-07-01' = {
       }
     ]
   }
-  dependsOn: [
-    containerApp
-  ]
 }
 
 resource containerAppDiagnostics 'Microsoft.Insights/diagnosticSettings@2021-05-01-preview' = {
@@ -368,26 +409,175 @@ resource containerAppDiagnostics 'Microsoft.Insights/diagnosticSettings@2021-05-
   }
 }
 
-resource dnsZone 'Microsoft.Network/dnsZones@2020-06-01' = if (dnsZoneName != '') {
+resource automationAccount 'Microsoft.Automation/automationAccounts@2023-11-01' = {
+  name: automationAccountName
+  location: location
+  identity: {
+    type: 'SystemAssigned'
+  }
+  properties: {
+    sku: {
+      name: 'Basic'
+    }
+    encryption: {
+      keySource: 'Microsoft.Automation'
+    }
+  }
+}
+
+resource backupRunbook 'Microsoft.Automation/automationAccounts/runbooks@2023-11-01' = {
+  name: runbookName
+  parent: automationAccount
+  properties: {
+    runbookType: 'PowerShell'
+    description: 'Creates daily snapshots of the PDS Azure Files share and manages retention'
+    publishContentLink: {
+      uri: 'data:text/plain;base64,${base64(backupRunbookScript)}'
+    }
+  }
+}
+
+resource backupSchedule 'Microsoft.Automation/automationAccounts/schedules@2023-11-01' = {
+  name: scheduleName
+  parent: automationAccount
+  properties: {
+    frequency: 'Week'
+    interval: 1
+    startTime: '${baseDateTime}T${split(maintenanceWindow, ' ')[1]}:00.000Z'
+    timeZone: 'UTC'
+    advancedSchedule: {
+      weekDays: [split(maintenanceWindow, ' ')[0]]
+    }
+    description: 'Daily backup schedule for PDS files'
+  }
+}
+
+resource jobSchedule 'Microsoft.Automation/automationAccounts/jobSchedules@2023-11-01' = {
+  name: guid(automationAccount.id, backupRunbook.id, backupSchedule.id)
+  parent: automationAccount
+  properties: {
+    runbook: {
+      name: backupRunbook.name
+    }
+    schedule: {
+      name: backupSchedule.name
+    }
+    parameters: {
+      StorageAccountName: storageAccount.name
+      ShareName: fileShareName
+      RetentionDays: string(backupRetentionDays)
+      ResourceGroupName: resourceGroup().name
+    }
+  }
+}
+
+// Grant Storage Account Contributor role to automation account
+resource automationStorageRoleAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(storageAccount.id, automationAccount.id, 'ba92f5b4-2d11-453d-a403-e96b0029c9fe')
+  scope: storageAccount
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'ba92f5b4-2d11-453d-a403-e96b0029c9fe') // Storage Account Contributor
+    principalId: automationAccount.identity.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+// Store storage account key in Key Vault for runbook access
+resource storageKeySecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = {
+  name: storageAccountKeySecretName
+  parent: keyVault
+  properties: {
+    value: storageAccount.listKeys().keys[0].value
+  }
+}
+
+// Grant Key Vault Secrets User role to automation account
+resource automationKvRoleAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(keyVault.id, automationAccount.id, '4633458b-17de-408a-b874-0445c86b69e6')
+  scope: keyVault
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '4633458b-17de-408a-b874-0445c86b69e6') // Key Vault Secrets User
+    principalId: automationAccount.identity.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+var backupRunbookScript = '''
+param(
+    [Parameter(Mandatory=$true)]
+    [string]$StorageAccountName,
+    
+    [Parameter(Mandatory=$true)]
+    [string]$ShareName,
+    
+    [Parameter(Mandatory=$true)]
+    [int]$RetentionDays,
+    
+    [Parameter(Mandatory=$true)]
+    [string]$ResourceGroupName
+)
+
+Write-Output "Starting backup process for storage account: $StorageAccountName, share: $ShareName"
+
+try {
+    # Connect using managed identity
+    Connect-AzAccount -Identity
+    
+    # Get storage account context
+    $storageAccount = Get-AzStorageAccount -ResourceGroupName $ResourceGroupName -Name $StorageAccountName
+    $ctx = $storageAccount.Context
+    
+    # Create snapshot with timestamp
+    $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
+    $snapshotName = "backup-$timestamp"
+    
+    Write-Output "Creating snapshot: $snapshotName"
+    $snapshot = New-AzStorageShare -Name $ShareName -Context $ctx -Snapshot
+    
+    Write-Output "Snapshot created successfully: $($snapshot.SnapshotTime)"
+    
+    # Clean up old snapshots
+    Write-Output "Cleaning up snapshots older than $RetentionDays days"
+    $cutoffDate = (Get-Date).AddDays(-$RetentionDays)
+    
+    $allSnapshots = Get-AzStorageShare -Name $ShareName -Context $ctx -IncludeSnapshot
+    $oldSnapshots = $allSnapshots | Where-Object { $_.IsSnapshot -and $_.SnapshotTime -lt $cutoffDate }
+    
+    foreach ($oldSnapshot in $oldSnapshots) {
+        Write-Output "Removing old snapshot from: $($oldSnapshot.SnapshotTime)"
+        Remove-AzStorageShare -Share $oldSnapshot -Force
+    }
+    
+    Write-Output "Backup process completed successfully"
+}
+catch {
+    Write-Error "Backup failed: $($_.Exception.Message)"
+    throw
+}
+'''
+
+resource dnsZone 'Microsoft.Network/dnsZones@2023-07-01-preview' = if (dnsZoneName != '') {
   name: dnsZoneName
   location: 'global'
 }
 
-resource dnsRecord 'Microsoft.Network/dnsZones/CNAME@2020-06-01' = if (dnsZoneName != '') {
-  name: '${dnsZone.name}/${dnsRecordName}'
+resource dnsRecord 'Microsoft.Network/dnsZones/CNAME@2023-07-01-preview' = if (dnsZoneName != '') {
+  name: dnsRecordName
+  parent: dnsZone
   properties: {
-    ttl: 300
-    cnameRecord: {
+    TTL: 300
+    CNAMERecord: {
       cname: containerApp.properties.configuration.ingress.fqdn
     }
   }
 }
 
-resource dnsWildcardRecord 'Microsoft.Network/dnsZones/CNAME@2020-06-01' = if (dnsZoneName != '') {
-  name: '${dnsZone.name}/*.${dnsRecordName}'
+resource dnsWildcardRecord 'Microsoft.Network/dnsZones/CNAME@2023-07-01-preview' = if (dnsZoneName != '') {
+  name: '*.${dnsRecordName}'
+  parent: dnsZone
   properties: {
-    ttl: 300
-    cnameRecord: {
+    TTL: 300
+    CNAMERecord: {
       cname: containerApp.properties.configuration.ingress.fqdn
     }
   }
@@ -398,3 +588,6 @@ output containerAppFqdn string = containerApp.properties.configuration.ingress.f
 output storageAccountId string = storageAccount.id
 output fileSharePath string = storageFileShare.name
 output keyVaultUri string = keyVault.properties.vaultUri
+output automationAccountName string = automationAccount.name
+output automationRunbookId string = backupRunbook.id
+output backupScheduleName string = backupSchedule.name

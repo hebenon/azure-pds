@@ -1,0 +1,21 @@
+# General OS artifacts
+.DS_Store
+Thumbs.db
+
+# Log and temp files
+*.log
+*.tmp
+*.swp
+
+# Environment configuration
+.env
+.env.*
+
+# Build outputs
+build/
+dist/
+out/
+
+# Dependency caches
+node_modules/
+__pycache__/
