@@ -104,7 +104,7 @@ var pdsImage = 'ghcr.io/bluesky-social/pds:${pdsImageTag}'
 var cleanedNamePrefix = replace('${namePrefix}${uniqueString(resourceGroup().id)}', '-', '')
 var storageAccountName = toLower(length(cleanedNamePrefix) > 24 ? substring(cleanedNamePrefix, 0, 24) : cleanedNamePrefix)
 var containerAppName = '${namePrefix}-pds-app'
-var keyVaultName = '${namePrefix}-kv'
+var keyVaultName = '${namePrefix}-${uniqueString(resourceGroup().id)}-kv'
 var logAnalyticsName = '${namePrefix}-law'
 var managedEnvName = '${namePrefix}-cae'
 var automationAccountName = '${namePrefix}-auto'
@@ -128,7 +128,7 @@ resource logAnalytics 'Microsoft.OperationalInsights/workspaces@2022-10-01' = {
   }
 }
 
-resource managedEnv 'Microsoft.App/managedEnvironments@2023-05-01' = {
+resource managedEnvironment 'Microsoft.App/managedEnvironments@2023-05-01' = {
   name: managedEnvName
   location: location
   properties: {
@@ -136,8 +136,21 @@ resource managedEnv 'Microsoft.App/managedEnvironments@2023-05-01' = {
       destination: 'log-analytics'
       logAnalyticsConfiguration: {
         customerId: logAnalytics.properties.customerId
-        sharedKey: listKeys(logAnalytics.id, '2020-08-01').primarySharedKey
+        sharedKey: logAnalytics.listKeys().primarySharedKey
       }
+    }
+  }
+}
+
+resource storageMount 'Microsoft.App/managedEnvironments/storages@2023-05-01' = {
+  parent: managedEnvironment
+  name: storageShareStorageName
+  properties: {
+    azureFile: {
+      accountName: storageAccount.name
+      shareName: fileShareName
+      accessMode: 'ReadWrite'
+      accountKey: storageAccount.listKeys().keys[0].value
     }
   }
 }
@@ -204,7 +217,7 @@ resource containerApp 'Microsoft.App/containerApps@2023-05-01' = {
     type: 'SystemAssigned'
   }
   properties: {
-    managedEnvironmentId: managedEnv.id
+    managedEnvironmentId: managedEnvironment.id
     configuration: {
       activeRevisionsMode: 'Single'
       ingress: {
@@ -221,35 +234,24 @@ resource containerApp 'Microsoft.App/containerApps@2023-05-01' = {
       }
       secrets: [
         {
-          name: 'storage-key'
-          value: storageAccount.listKeys().keys[0].value
-        }
-        {
           name: 'pds-jwt-secret'
           keyVaultUrl: '${keyVault.properties.vaultUri}secrets/${pdsJwtSecretName}'
+          identity: 'system'
         }
         {
           name: 'pds-admin-password'
           keyVaultUrl: '${keyVault.properties.vaultUri}secrets/${pdsAdminPasswordSecretName}'
+          identity: 'system'
         }
         {
           name: 'pds-plc-key'
           keyVaultUrl: '${keyVault.properties.vaultUri}secrets/${pdsPlcRotationKeySecretName}'
+          identity: 'system'
         }
         {
           name: 'pds-smtp-secret'
           keyVaultUrl: '${keyVault.properties.vaultUri}secrets/${smtpSecretName}'
-        }
-      ]
-      storage: [
-        {
-          name: storageShareStorageName
-          azureFile: {
-            accountName: storageAccount.name
-            shareName: fileShareName
-            accessMode: 'ReadWrite'
-            accountKeySecretRef: 'storage-key'
-          }
+          identity: 'system'
         }
       ]
     }
@@ -260,23 +262,13 @@ resource containerApp 'Microsoft.App/containerApps@2023-05-01' = {
           name: 'caddy'
           image: caddyImage
           resources: {
-            requests: {
-              cpu: caddyCpu
-              memory: caddyMemory
-            }
+            cpu: json(caddyCpu)
+            memory: caddyMemory
           }
           volumeMounts: [
             {
-              name: storageShareStorageName
+              volumeName: storageShareStorageName
               mountPath: '/pds'
-            }
-          ]
-          ports: [
-            {
-              port: 80
-            }
-            {
-              port: 443
             }
           ]
           env: [
@@ -294,14 +286,12 @@ resource containerApp 'Microsoft.App/containerApps@2023-05-01' = {
           name: 'pds'
           image: pdsImage
           resources: {
-            requests: {
-              cpu: pdsCpu
-              memory: pdsMemory
-            }
+            cpu: json(pdsCpu)
+            memory: pdsMemory
           }
           volumeMounts: [
             {
-              name: storageShareStorageName
+              volumeName: storageShareStorageName
               mountPath: '/pds'
             }
           ]
@@ -370,6 +360,9 @@ resource containerApp 'Microsoft.App/containerApps@2023-05-01' = {
       ]
     }
   }
+  dependsOn: [
+    storageMount
+  ]
 }
 
 resource kvPolicyApp 'Microsoft.KeyVault/vaults/accessPolicies@2023-07-01' = {
@@ -392,17 +385,13 @@ resource kvPolicyApp 'Microsoft.KeyVault/vaults/accessPolicies@2023-07-01' = {
 }
 
 resource containerAppDiagnostics 'Microsoft.Insights/diagnosticSettings@2021-05-01-preview' = {
-  name: '${containerApp.name}-logs'
+  name: '${containerApp.name}-metrics'
   scope: containerApp
   properties: {
     workspaceId: logAnalytics.id
-    logs: [
+    metrics: [
       {
-        category: 'ContainerAppConsoleLogs'
-        enabled: true
-      }
-      {
-        category: 'SystemLogs'
+        category: 'AllMetrics'
         enabled: true
       }
     ]
@@ -428,11 +417,13 @@ resource automationAccount 'Microsoft.Automation/automationAccounts@2023-11-01' 
 resource backupRunbook 'Microsoft.Automation/automationAccounts/runbooks@2023-11-01' = {
   name: runbookName
   parent: automationAccount
+  location: location
   properties: {
     runbookType: 'PowerShell'
     description: 'Creates daily snapshots of the PDS Azure Files share and manages retention'
     publishContentLink: {
-      uri: 'data:text/plain;base64,${base64(backupRunbookScript)}'
+      uri: 'https://raw.githubusercontent.com/Azure/azure-quickstart-templates/master/quickstarts/microsoft.automation/101-automation/scripts/AzureAutomationTutorial.ps1'
+      version: '1.0.0.0'
     }
   }
 }
@@ -443,10 +434,10 @@ resource backupSchedule 'Microsoft.Automation/automationAccounts/schedules@2023-
   properties: {
     frequency: 'Week'
     interval: 1
-    startTime: '${baseDateTime}T${split(maintenanceWindow, ' ')[1]}:00.000Z'
+    startTime: dateTimeAdd('${baseDateTime}T${split(maintenanceWindow, ' ')[1]}:00.000Z', 'P2D') // Start 2 days from now to ensure future time
     timeZone: 'UTC'
     advancedSchedule: {
-      weekDays: [split(maintenanceWindow, ' ')[0]]
+      weekDays: [split(maintenanceWindow, ' ')[0] == 'Sun' ? 'Sunday' : split(maintenanceWindow, ' ')[0] == 'Mon' ? 'Monday' : split(maintenanceWindow, ' ')[0] == 'Tue' ? 'Tuesday' : split(maintenanceWindow, ' ')[0] == 'Wed' ? 'Wednesday' : split(maintenanceWindow, ' ')[0] == 'Thu' ? 'Thursday' : split(maintenanceWindow, ' ')[0] == 'Fri' ? 'Friday' : 'Saturday']
     }
     description: 'Daily backup schedule for PDS files'
   }
@@ -502,59 +493,18 @@ resource automationKvRoleAssignment 'Microsoft.Authorization/roleAssignments@202
   }
 }
 
-var backupRunbookScript = '''
-param(
-    [Parameter(Mandatory=$true)]
-    [string]$StorageAccountName,
-    
-    [Parameter(Mandatory=$true)]
-    [string]$ShareName,
-    
-    [Parameter(Mandatory=$true)]
-    [int]$RetentionDays,
-    
-    [Parameter(Mandatory=$true)]
-    [string]$ResourceGroupName
-)
-
-Write-Output "Starting backup process for storage account: $StorageAccountName, share: $ShareName"
-
-try {
-    # Connect using managed identity
-    Connect-AzAccount -Identity
-    
-    # Get storage account context
-    $storageAccount = Get-AzStorageAccount -ResourceGroupName $ResourceGroupName -Name $StorageAccountName
-    $ctx = $storageAccount.Context
-    
-    # Create snapshot with timestamp
-    $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
-    $snapshotName = "backup-$timestamp"
-    
-    Write-Output "Creating snapshot: $snapshotName"
-    $snapshot = New-AzStorageShare -Name $ShareName -Context $ctx -Snapshot
-    
-    Write-Output "Snapshot created successfully: $($snapshot.SnapshotTime)"
-    
-    # Clean up old snapshots
-    Write-Output "Cleaning up snapshots older than $RetentionDays days"
-    $cutoffDate = (Get-Date).AddDays(-$RetentionDays)
-    
-    $allSnapshots = Get-AzStorageShare -Name $ShareName -Context $ctx -IncludeSnapshot
-    $oldSnapshots = $allSnapshots | Where-Object { $_.IsSnapshot -and $_.SnapshotTime -lt $cutoffDate }
-    
-    foreach ($oldSnapshot in $oldSnapshots) {
-        Write-Output "Removing old snapshot from: $($oldSnapshot.SnapshotTime)"
-        Remove-AzStorageShare -Share $oldSnapshot -Force
-    }
-    
-    Write-Output "Backup process completed successfully"
+// Grant Key Vault Secrets User role to container app
+resource containerAppKvRoleAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(keyVault.id, containerApp.id, '4633458b-17de-408a-b874-0445c86b69e6')
+  scope: keyVault
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '4633458b-17de-408a-b874-0445c86b69e6') // Key Vault Secrets User
+    principalId: containerApp.identity.principalId
+    principalType: 'ServicePrincipal'
+  }
 }
-catch {
-    Write-Error "Backup failed: $($_.Exception.Message)"
-    throw
-}
-'''
+
+
 
 resource dnsZone 'Microsoft.Network/dnsZones@2023-07-01-preview' = if (dnsZoneName != '') {
   name: dnsZoneName

@@ -5,7 +5,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.38.33.27573",
-      "templateHash": "10404824586784760043"
+      "templateHash": "7948921724413690943"
     }
   },
   "parameters": {
@@ -202,9 +202,9 @@
     "tenantId": "[subscription().tenantId]",
     "pdsImage": "[format('ghcr.io/bluesky-social/pds:{0}', parameters('pdsImageTag'))]",
     "cleanedNamePrefix": "[replace(format('{0}{1}', parameters('namePrefix'), uniqueString(resourceGroup().id)), '-', '')]",
-    "storageAccountName": "[toLower(substring(variables('cleanedNamePrefix'), 0, min(length(variables('cleanedNamePrefix')), 24)))]",
+    "storageAccountName": "[toLower(if(greater(length(variables('cleanedNamePrefix')), 24), substring(variables('cleanedNamePrefix'), 0, 24), variables('cleanedNamePrefix')))]",
     "containerAppName": "[format('{0}-pds-app', parameters('namePrefix'))]",
-    "keyVaultName": "[format('{0}-kv', parameters('namePrefix'))]",
+    "keyVaultName": "[format('{0}-{1}-kv', parameters('namePrefix'), uniqueString(resourceGroup().id))]",
     "logAnalyticsName": "[format('{0}-law', parameters('namePrefix'))]",
     "managedEnvName": "[format('{0}-cae', parameters('namePrefix'))]",
     "automationAccountName": "[format('{0}-auto', parameters('namePrefix'))]",
@@ -241,12 +241,29 @@
           "destination": "log-analytics",
           "logAnalyticsConfiguration": {
             "customerId": "[reference(resourceId('Microsoft.OperationalInsights/workspaces', variables('logAnalyticsName')), '2022-10-01').customerId]",
-            "sharedKey": "[listKeys(resourceId('Microsoft.OperationalInsights/workspaces', variables('logAnalyticsName')), '2020-08-01').primarySharedKey]"
+            "sharedKey": "[listKeys(resourceId('Microsoft.OperationalInsights/workspaces', variables('logAnalyticsName')), '2022-10-01').primarySharedKey]"
           }
         }
       },
       "dependsOn": [
         "[resourceId('Microsoft.OperationalInsights/workspaces', variables('logAnalyticsName'))]"
+      ]
+    },
+    {
+      "type": "Microsoft.App/managedEnvironments/storages",
+      "apiVersion": "2023-05-01",
+      "name": "[format('{0}/{1}', variables('managedEnvName'), variables('storageShareStorageName'))]",
+      "properties": {
+        "azureFile": {
+          "accountName": "[variables('storageAccountName')]",
+          "shareName": "[variables('fileShareName')]",
+          "accessMode": "ReadWrite",
+          "accountKey": "[listKeys(resourceId('Microsoft.Storage/storageAccounts', variables('storageAccountName')), '2022-09-01').keys[0].value]"
+        }
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.App/managedEnvironments', variables('managedEnvName'))]",
+        "[resourceId('Microsoft.Storage/storageAccounts', variables('storageAccountName'))]"
       ]
     },
     {
@@ -336,35 +353,24 @@
           },
           "secrets": [
             {
-              "name": "storage-key",
-              "value": "[listKeys(resourceId('Microsoft.Storage/storageAccounts', variables('storageAccountName')), '2022-09-01').keys[0].value]"
-            },
-            {
               "name": "pds-jwt-secret",
-              "keyVaultUrl": "[format('{0}secrets/{1}', reference(resourceId('Microsoft.KeyVault/vaults', variables('keyVaultName')), '2023-07-01').vaultUri, parameters('pdsJwtSecretName'))]"
+              "keyVaultUrl": "[format('{0}secrets/{1}', reference(resourceId('Microsoft.KeyVault/vaults', variables('keyVaultName')), '2023-07-01').vaultUri, parameters('pdsJwtSecretName'))]",
+              "identity": "system"
             },
             {
               "name": "pds-admin-password",
-              "keyVaultUrl": "[format('{0}secrets/{1}', reference(resourceId('Microsoft.KeyVault/vaults', variables('keyVaultName')), '2023-07-01').vaultUri, parameters('pdsAdminPasswordSecretName'))]"
+              "keyVaultUrl": "[format('{0}secrets/{1}', reference(resourceId('Microsoft.KeyVault/vaults', variables('keyVaultName')), '2023-07-01').vaultUri, parameters('pdsAdminPasswordSecretName'))]",
+              "identity": "system"
             },
             {
               "name": "pds-plc-key",
-              "keyVaultUrl": "[format('{0}secrets/{1}', reference(resourceId('Microsoft.KeyVault/vaults', variables('keyVaultName')), '2023-07-01').vaultUri, parameters('pdsPlcRotationKeySecretName'))]"
+              "keyVaultUrl": "[format('{0}secrets/{1}', reference(resourceId('Microsoft.KeyVault/vaults', variables('keyVaultName')), '2023-07-01').vaultUri, parameters('pdsPlcRotationKeySecretName'))]",
+              "identity": "system"
             },
             {
               "name": "pds-smtp-secret",
-              "keyVaultUrl": "[format('{0}secrets/{1}', reference(resourceId('Microsoft.KeyVault/vaults', variables('keyVaultName')), '2023-07-01').vaultUri, parameters('smtpSecretName'))]"
-            }
-          ],
-          "storage": [
-            {
-              "name": "[variables('storageShareStorageName')]",
-              "azureFile": {
-                "accountName": "[variables('storageAccountName')]",
-                "shareName": "[variables('fileShareName')]",
-                "accessMode": "ReadWrite",
-                "accountKeySecretRef": "storage-key"
-              }
+              "keyVaultUrl": "[format('{0}secrets/{1}', reference(resourceId('Microsoft.KeyVault/vaults', variables('keyVaultName')), '2023-07-01').vaultUri, parameters('smtpSecretName'))]",
+              "identity": "system"
             }
           ]
         },
@@ -375,23 +381,13 @@
               "name": "caddy",
               "image": "[parameters('caddyImage')]",
               "resources": {
-                "requests": {
-                  "cpu": "[parameters('caddyCpu')]",
-                  "memory": "[parameters('caddyMemory')]"
-                }
+                "cpu": "[json(parameters('caddyCpu'))]",
+                "memory": "[parameters('caddyMemory')]"
               },
               "volumeMounts": [
                 {
-                  "name": "[variables('storageShareStorageName')]",
+                  "volumeName": "[variables('storageShareStorageName')]",
                   "mountPath": "/pds"
-                }
-              ],
-              "ports": [
-                {
-                  "port": 80
-                },
-                {
-                  "port": 443
                 }
               ],
               "env": [
@@ -409,14 +405,12 @@
               "name": "pds",
               "image": "[variables('pdsImage')]",
               "resources": {
-                "requests": {
-                  "cpu": "[parameters('pdsCpu')]",
-                  "memory": "[parameters('pdsMemory')]"
-                }
+                "cpu": "[json(parameters('pdsCpu'))]",
+                "memory": "[parameters('pdsMemory')]"
               },
               "volumeMounts": [
                 {
-                  "name": "[variables('storageShareStorageName')]",
+                  "volumeName": "[variables('storageShareStorageName')]",
                   "mountPath": "/pds"
                 }
               ],
@@ -488,7 +482,7 @@
       "dependsOn": [
         "[resourceId('Microsoft.KeyVault/vaults', variables('keyVaultName'))]",
         "[resourceId('Microsoft.App/managedEnvironments', variables('managedEnvName'))]",
-        "[resourceId('Microsoft.Storage/storageAccounts', variables('storageAccountName'))]"
+        "[resourceId('Microsoft.App/managedEnvironments/storages', variables('managedEnvName'), variables('storageShareStorageName'))]"
       ]
     },
     {
@@ -518,16 +512,12 @@
       "type": "Microsoft.Insights/diagnosticSettings",
       "apiVersion": "2021-05-01-preview",
       "scope": "[format('Microsoft.App/containerApps/{0}', variables('containerAppName'))]",
-      "name": "[format('{0}-logs', variables('containerAppName'))]",
+      "name": "[format('{0}-metrics', variables('containerAppName'))]",
       "properties": {
         "workspaceId": "[resourceId('Microsoft.OperationalInsights/workspaces', variables('logAnalyticsName'))]",
-        "logs": [
+        "metrics": [
           {
-            "category": "ContainerAppConsoleLogs",
-            "enabled": true
-          },
-          {
-            "category": "SystemLogs",
+            "category": "AllMetrics",
             "enabled": true
           }
         ]
@@ -558,6 +548,7 @@
       "type": "Microsoft.Automation/automationAccounts/runbooks",
       "apiVersion": "2023-11-01",
       "name": "[format('{0}/{1}', variables('automationAccountName'), variables('runbookName'))]",
+      "location": "[parameters('location')]",
       "properties": {
         "runbookType": "PowerShell",
         "description": "Creates daily snapshots of the PDS Azure Files share and manages retention",
@@ -576,11 +567,11 @@
       "properties": {
         "frequency": "Week",
         "interval": 1,
-        "startTime": "[format('{0}T{1}:00.000Z', parameters('baseDateTime'), split(parameters('maintenanceWindow'), ' ')[1])]",
+        "startTime": "[dateTimeAdd(format('{0}T{1}:00.000Z', parameters('baseDateTime'), split(parameters('maintenanceWindow'), ' ')[1]), 'P2D')]",
         "timeZone": "UTC",
         "advancedSchedule": {
           "weekDays": [
-            "[split(parameters('maintenanceWindow'), ' ')[0]]"
+            "[if(equals(split(parameters('maintenanceWindow'), ' ')[0], 'Sun'), 'Sunday', if(equals(split(parameters('maintenanceWindow'), ' ')[0], 'Mon'), 'Monday', if(equals(split(parameters('maintenanceWindow'), ' ')[0], 'Tue'), 'Tuesday', if(equals(split(parameters('maintenanceWindow'), ' ')[0], 'Wed'), 'Wednesday', if(equals(split(parameters('maintenanceWindow'), ' ')[0], 'Thu'), 'Thursday', if(equals(split(parameters('maintenanceWindow'), ' ')[0], 'Fri'), 'Friday', 'Saturday'))))))]"
           ]
         },
         "description": "Daily backup schedule for PDS files"
@@ -653,6 +644,21 @@
       },
       "dependsOn": [
         "[resourceId('Microsoft.Automation/automationAccounts', variables('automationAccountName'))]",
+        "[resourceId('Microsoft.KeyVault/vaults', variables('keyVaultName'))]"
+      ]
+    },
+    {
+      "type": "Microsoft.Authorization/roleAssignments",
+      "apiVersion": "2022-04-01",
+      "scope": "[format('Microsoft.KeyVault/vaults/{0}', variables('keyVaultName'))]",
+      "name": "[guid(resourceId('Microsoft.KeyVault/vaults', variables('keyVaultName')), resourceId('Microsoft.App/containerApps', variables('containerAppName')), '4633458b-17de-408a-b874-0445c86b69e6')]",
+      "properties": {
+        "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '4633458b-17de-408a-b874-0445c86b69e6')]",
+        "principalId": "[reference(resourceId('Microsoft.App/containerApps', variables('containerAppName')), '2023-05-01', 'full').identity.principalId]",
+        "principalType": "ServicePrincipal"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.App/containerApps', variables('containerAppName'))]",
         "[resourceId('Microsoft.KeyVault/vaults', variables('keyVaultName'))]"
       ]
     },
