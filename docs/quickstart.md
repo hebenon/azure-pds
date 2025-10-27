@@ -45,16 +45,26 @@ az deployment group create \
     pdsHostname=<HOSTNAME> \
     pdsImageTag=<TAG> \
     adminObjectId=<ADMIN_OBJECT_ID> \
-    emailFromAddress=<EMAIL_FROM_ADDRESS> \
+    enableCommunicationServices=<true|false> \
+    emailCustomDomain=<CUSTOM_DOMAIN_OR_EMPTY> \
     pdsJwtSecretName=<JWT_SECRET_NAME> \
     pdsAdminPasswordSecretName=<ADMIN_PASSWORD_SECRET_NAME> \
     pdsPlcRotationKeySecretName=<PLC_KEY_SECRET_NAME> \
-    smtpSecretName=<SMTP_SECRET_NAME> \
     dnsZoneName=<DNS_ZONE> \
     dnsRecordName=<DNS_RECORD> \
     maintenanceWindow="Sun 02:00" \
     backupRetentionDays=30
 ```
+
+> **Backups**: The automation runbook runs **daily** at the UTC time specified by `maintenanceWindow`. The day token is kept for operator clarity only.
+
+> **Email Prerequisite**: When `enableCommunicationServices=true`, run `scripts/acs-smtp-setup.sh` after the domain reports `Verified` to create the Microsoft Entra application and populate the SMTP secrets.
+
+> **SMTP Placeholder**: The template seeds a temporary `PDS-SMTP-URL` value so the Container App can start. Always rerun `scripts/acs-smtp-setup.sh` after each deployment to refresh the real SMTP credentials in Key Vault.
+
+> **SMTP Secret Name**: The template defaults to the `PDS-SMTP-URL` secret in Key Vault. Only pass `smtpSecretName` if you need to override that name.
+
+> **Runbook Content**: If you are deploying from a feature branch or fork, override `backupRunbookContentUri` (and its matching `backupRunbookContentHash`) so the automation account can download the runbook from your branch.
 
 Record the deployment outputs for Key Vault, Container App, Storage Account, and Automation Account identifiers. These values are referenced throughout the remaining steps.
 
@@ -63,6 +73,9 @@ Record the deployment outputs for Key Vault, Container App, Storage Account, and
 - `containerAppFqdn` - Container App public endpoint
 - `automationAccountName` - Automation Account for backup verification
 - `storageAccountId` - Storage Account resource ID
+- `communicationServiceEndpoint` - Azure Communication Services endpoint (if enabled)
+- `smtpServer` - SMTP server hostname (`smtp.azurecomm.net`)
+- `smtpPort` - SMTP server port (`587`)
 
 ## 4. Populate Key Vault Secrets
 
@@ -72,8 +85,18 @@ Record the deployment outputs for Key Vault, Container App, Storage Account, and
    az keyvault secret set --vault-name <KV_NAME> --name PDS-JWT-SECRET --value <JWT_SECRET>
    az keyvault secret set --vault-name <KV_NAME> --name PDS-ADMIN-PASSWORD --value <PASSWORD>
    az keyvault secret set --vault-name <KV_NAME> --name PDS-PLC-KEY --value <HEX_VALUE>
-   az keyvault secret set --vault-name <KV_NAME> --name PDS-SMTP-SECRET --value <SMTP_URL>
+  # Optional: If enableCommunicationServices=false, provide your own SMTP URL
+  az keyvault secret set --vault-name <KV_NAME> --name PDS-SMTP-URL --value <SMTP_URL>
    ```
+  When ACS email is enabled, run:
+  ```bash
+  ./scripts/acs-smtp-setup.sh \
+    --resource-group <RESOURCE_GROUP> \
+    --communication-service <PREFIX>-acs \
+    --email-service <PREFIX>-email \
+    --key-vault <KV_NAME>
+  ```
+
 3. Restart the Container App revision if secrets were created after deployment:
    ```bash
    az containerapp revision restart \

@@ -55,12 +55,23 @@ param pdsPlcRotationKeySecretName string
 @description('Name of the Key Vault secret containing the SMTP connection string or password.')
 @minLength(1)
 @maxLength(127)
-param smtpSecretName string
+param smtpSecretName string = 'PDS-SMTP-URL'
 
-@description('From address to use when PDS sends email.')
-@minLength(5)
+@description('Name of the Key Vault secret containing the computed email from address.')
+@minLength(1)
+@maxLength(127)
+param emailFromAddressSecretName string = 'PDS-EMAIL-FROM-ADDRESS'
+
+@description('From address to use when PDS sends email. Leave empty to auto-use Azure-managed domain when enableCommunicationServices=true.')
 @maxLength(320)
-param emailFromAddress string
+param emailFromAddress string = ''
+
+@description('Whether to provision Azure Communication Services for email sending.')
+param enableCommunicationServices bool = true
+
+@description('Custom domain name for Azure Communication Services Email (e.g. notify.example.com). Leave empty to use Azure-managed domain.')
+@maxLength(253)
+param emailCustomDomain string = ''
 
 @description('Object ID for an administrator that should have full access to the Key Vault.')
 @minLength(36)
@@ -99,11 +110,18 @@ param backupRetentionDays int = 30
 @description('Base date for schedule calculation.')
 param baseDateTime string = utcNow('yyyy-MM-dd')
 
+@description('URI hosting the Automation runbook PowerShell script.')
+param backupRunbookContentUri string = 'https://raw.githubusercontent.com/bluesky-social/azure-pds/main/scripts/runbooks/BackupPdsFiles.ps1'
+
+@description('SHA256 hash of the Automation runbook script content.')
+param backupRunbookContentHash string = '40b3063d62778cebaf5390b6fdfaf2e2d9f9470a7e838e7615676ca273b6656d'
+
 var tenantId = subscription().tenantId
 var pdsImage = 'ghcr.io/bluesky-social/pds:${pdsImageTag}'
 var cleanedNamePrefix = replace('${namePrefix}${uniqueString(resourceGroup().id)}', '-', '')
 var storageAccountName = toLower(length(cleanedNamePrefix) > 24 ? substring(cleanedNamePrefix, 0, 24) : cleanedNamePrefix)
 var containerAppName = '${namePrefix}-pds-app'
+var containerAppIdentityName = '${namePrefix}-pds-id'
 var keyVaultName = '${namePrefix}-${uniqueString(resourceGroup().id)}-kv'
 var logAnalyticsName = '${namePrefix}-law'
 var managedEnvName = '${namePrefix}-cae'
@@ -113,6 +131,31 @@ var scheduleName = 'DailyBackupSchedule'
 var fileShareName = 'pds'
 var storageShareStorageName = 'pdsfiles'
 var storageAccountKeySecretName = 'storage-account-key'
+var communicationServiceName = '${namePrefix}-acs'
+var emailServiceName = '${namePrefix}-email'
+var hasEmailFromOverride = length(emailFromAddress) > 0
+var includeSmtpSecret = length(smtpSecretName) > 0
+var maintenanceParts = split(maintenanceWindow, ' ')
+var maintenanceTimePart = length(maintenanceParts) > 1 ? maintenanceParts[1] : maintenanceWindow
+var maintenanceTimeSegments = split(maintenanceTimePart, ':')
+var maintenanceHour = padLeft(maintenanceTimeSegments[0], 2, '0')
+var maintenanceMinute = padLeft(length(maintenanceTimeSegments) > 1 ? maintenanceTimeSegments[1] : '00', 2, '0')
+var scheduleStartTime = dateTimeAdd('${baseDateTime}T${maintenanceHour}:${maintenanceMinute}:00.000Z', 'P2D')
+// Compute the email from address based on configuration
+var computedEmailFromAddress = hasEmailFromOverride ? emailFromAddress : enableCommunicationServices && emailCustomDomain != '' ? 'donotreply@${emailCustomDomain}' : enableCommunicationServices ? 'donotreply@placeholder.azurecomm.net' : 'donotreply@example.com'
+var smtpPlaceholderValue = 'smtps://pending-update@smtp.azurecomm.net:587'
+var backupRunbookContentLink = {
+  uri: backupRunbookContentUri
+  contentHash: {
+    algorithm: 'sha256'
+    value: backupRunbookContentHash
+  }
+}
+
+resource containerAppIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2018-11-30' = {
+  name: containerAppIdentityName
+  location: location
+}
 
 resource logAnalytics 'Microsoft.OperationalInsights/workspaces@2022-10-01' = {
   name: logAnalyticsName
@@ -214,7 +257,10 @@ resource containerApp 'Microsoft.App/containerApps@2023-05-01' = {
   name: containerAppName
   location: location
   identity: {
-    type: 'SystemAssigned'
+    type: 'UserAssigned'
+    userAssignedIdentities: {
+      '${containerAppIdentity.id}': {}
+    }
   }
   properties: {
     managedEnvironmentId: managedEnvironment.id
@@ -232,28 +278,34 @@ resource containerApp 'Microsoft.App/containerApps@2023-05-01' = {
           }
         ]
       }
-      secrets: [
+      secrets: concat([
         {
           name: 'pds-jwt-secret'
           keyVaultUrl: '${keyVault.properties.vaultUri}secrets/${pdsJwtSecretName}'
-          identity: 'system'
+          identity: 'userAssigned'
         }
         {
           name: 'pds-admin-password'
           keyVaultUrl: '${keyVault.properties.vaultUri}secrets/${pdsAdminPasswordSecretName}'
-          identity: 'system'
+          identity: 'userAssigned'
         }
         {
           name: 'pds-plc-key'
           keyVaultUrl: '${keyVault.properties.vaultUri}secrets/${pdsPlcRotationKeySecretName}'
-          identity: 'system'
+          identity: 'userAssigned'
         }
+        {
+          name: 'pds-email-from-address'
+          keyVaultUrl: '${keyVault.properties.vaultUri}secrets/${emailFromAddressSecretName}'
+          identity: 'userAssigned'
+        }
+      ], includeSmtpSecret ? [
         {
           name: 'pds-smtp-secret'
           keyVaultUrl: '${keyVault.properties.vaultUri}secrets/${smtpSecretName}'
-          identity: 'system'
+          identity: 'userAssigned'
         }
-      ]
+      ] : [])
     }
     template: {
       revisionSuffix: toLower(format('r{0}', uniqueString(pdsImage)))
@@ -295,7 +347,7 @@ resource containerApp 'Microsoft.App/containerApps@2023-05-01' = {
               mountPath: '/pds'
             }
           ]
-          env: [
+          env: concat([
             {
               name: 'PDS_PORT'
               value: '2583'
@@ -326,7 +378,7 @@ resource containerApp 'Microsoft.App/containerApps@2023-05-01' = {
             }
             {
               name: 'PDS_EMAIL_FROM_ADDRESS'
-              value: emailFromAddress
+              secretRef: 'pds-email-from-address'
             }
             {
               name: 'PDS_JWT_SECRET'
@@ -340,11 +392,12 @@ resource containerApp 'Microsoft.App/containerApps@2023-05-01' = {
               name: 'PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX'
               secretRef: 'pds-plc-key'
             }
+          ], includeSmtpSecret ? [
             {
               name: 'PDS_EMAIL_SMTP_URL'
               secretRef: 'pds-smtp-secret'
             }
-          ]
+          ] : [])
         }
       ]
       scale: {
@@ -360,8 +413,15 @@ resource containerApp 'Microsoft.App/containerApps@2023-05-01' = {
       ]
     }
   }
-  dependsOn: [
+  dependsOn: enableCommunicationServices ? [
     storageMount
+    emailFromAddressSecret
+    smtpSecretSeed
+    kvPolicyApp
+  ] : [
+    storageMount
+    emailFromAddressSecret
+    kvPolicyApp
   ]
 }
 
@@ -372,7 +432,7 @@ resource kvPolicyApp 'Microsoft.KeyVault/vaults/accessPolicies@2023-07-01' = {
     accessPolicies: [
       {
         tenantId: tenantId
-        objectId: containerApp.identity.principalId
+        objectId: containerAppIdentity.properties.principalId
         permissions: {
           secrets: [
             'get'
@@ -422,8 +482,8 @@ resource backupRunbook 'Microsoft.Automation/automationAccounts/runbooks@2023-11
     runbookType: 'PowerShell'
     description: 'Creates daily snapshots of the PDS Azure Files share and manages retention'
     publishContentLink: {
-      uri: 'https://raw.githubusercontent.com/Azure/azure-quickstart-templates/master/quickstarts/microsoft.automation/101-automation/scripts/AzureAutomationTutorial.ps1'
-      version: '1.0.0.0'
+  uri: backupRunbookContentLink.uri
+  contentHash: backupRunbookContentLink.contentHash
     }
   }
 }
@@ -432,13 +492,10 @@ resource backupSchedule 'Microsoft.Automation/automationAccounts/schedules@2023-
   name: scheduleName
   parent: automationAccount
   properties: {
-    frequency: 'Week'
+    frequency: 'Day'
     interval: 1
-    startTime: dateTimeAdd('${baseDateTime}T${split(maintenanceWindow, ' ')[1]}:00.000Z', 'P2D') // Start 2 days from now to ensure future time
+    startTime: scheduleStartTime
     timeZone: 'UTC'
-    advancedSchedule: {
-      weekDays: [split(maintenanceWindow, ' ')[0] == 'Sun' ? 'Sunday' : split(maintenanceWindow, ' ')[0] == 'Mon' ? 'Monday' : split(maintenanceWindow, ' ')[0] == 'Tue' ? 'Tuesday' : split(maintenanceWindow, ' ')[0] == 'Wed' ? 'Wednesday' : split(maintenanceWindow, ' ')[0] == 'Thu' ? 'Thursday' : split(maintenanceWindow, ' ')[0] == 'Fri' ? 'Friday' : 'Saturday']
-    }
     description: 'Daily backup schedule for PDS files'
   }
 }
@@ -464,7 +521,7 @@ resource jobSchedule 'Microsoft.Automation/automationAccounts/jobSchedules@2023-
 
 // Grant Storage Account Contributor role to automation account
 resource automationStorageRoleAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(storageAccount.id, automationAccount.id, 'ba92f5b4-2d11-453d-a403-e96b0029c9fe')
+  name: guid(storageAccount.id, automationAccount.id, 'ba92f5b4-2d11-453d-a403-e96b0029c9fe', 'storage')
   scope: storageAccount
   properties: {
     roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'ba92f5b4-2d11-453d-a403-e96b0029c9fe') // Storage Account Contributor
@@ -484,7 +541,7 @@ resource storageKeySecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = {
 
 // Grant Key Vault Secrets User role to automation account
 resource automationKvRoleAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(keyVault.id, automationAccount.id, '4633458b-17de-408a-b874-0445c86b69e6')
+  name: guid(keyVault.id, automationAccount.id, '4633458b-17de-408a-b874-0445c86b69e6', 'automation')
   scope: keyVault
   properties: {
     roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '4633458b-17de-408a-b874-0445c86b69e6') // Key Vault Secrets User
@@ -495,20 +552,72 @@ resource automationKvRoleAssignment 'Microsoft.Authorization/roleAssignments@202
 
 // Grant Key Vault Secrets User role to container app
 resource containerAppKvRoleAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(keyVault.id, containerApp.id, '4633458b-17de-408a-b874-0445c86b69e6')
+  name: guid(keyVault.id, containerApp.id, '4633458b-17de-408a-b874-0445c86b69e6', 'containerapp')
   scope: keyVault
   properties: {
     roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '4633458b-17de-408a-b874-0445c86b69e6') // Key Vault Secrets User
-    principalId: containerApp.identity.principalId
+    principalId: containerAppIdentity.properties.principalId
     principalType: 'ServicePrincipal'
   }
 }
 
+// Azure Communication Services for Email
+resource emailService 'Microsoft.Communication/emailServices@2023-04-01' = if (enableCommunicationServices) {
+  name: emailServiceName
+  location: 'global'
+  properties: {
+    dataLocation: 'United States'
+  }
+}
 
+resource emailDomain 'Microsoft.Communication/emailServices/domains@2023-04-01' = if (enableCommunicationServices && emailCustomDomain == '') {
+  name: 'AzureManagedDomain'
+  parent: emailService
+  location: 'global'
+  properties: {
+    domainManagement: 'AzureManaged'
+  }
+}
+
+resource emailCustomDomainResource 'Microsoft.Communication/emailServices/domains@2023-04-01' = if (enableCommunicationServices && emailCustomDomain != '') {
+  name: emailCustomDomain
+  parent: emailService
+  location: 'global'
+  properties: {
+    domainManagement: 'CustomerManaged'
+  }
+}
+
+resource communicationService 'Microsoft.Communication/communicationServices@2023-04-01' = if (enableCommunicationServices) {
+  name: communicationServiceName
+  location: 'global'
+  properties: {
+    dataLocation: 'United States'
+    linkedDomains: [
+      emailCustomDomain == '' ? emailDomain.id : emailCustomDomainResource.id
+    ]
+  }
+}
 
 resource dnsZone 'Microsoft.Network/dnsZones@2023-07-01-preview' = if (dnsZoneName != '') {
   name: dnsZoneName
   location: 'global'
+}
+
+resource emailFromAddressSecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = {
+  name: emailFromAddressSecretName
+  parent: keyVault
+  properties: {
+    value: computedEmailFromAddress
+  }
+}
+
+resource smtpSecretSeed 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = if (enableCommunicationServices) {
+  name: smtpSecretName
+  parent: keyVault
+  properties: {
+    value: smtpPlaceholderValue
+  }
 }
 
 resource dnsRecord 'Microsoft.Network/dnsZones/CNAME@2023-07-01-preview' = if (dnsZoneName != '') {
@@ -541,3 +650,11 @@ output keyVaultUri string = keyVault.properties.vaultUri
 output automationAccountName string = automationAccount.name
 output automationRunbookId string = backupRunbook.id
 output backupScheduleName string = backupSchedule.name
+output communicationServiceEndpoint string = enableCommunicationServices ? communicationService!.properties.hostName : ''
+output emailServiceName string = enableCommunicationServices ? emailService!.name : ''
+output smtpServer string = 'smtp.azurecomm.net'
+output smtpPort int = 587
+output communicationServiceResourceId string = enableCommunicationServices ? communicationService!.id : ''
+output emailDomainResourceId string = enableCommunicationServices ? (emailCustomDomain == '' ? emailDomain!.id : emailCustomDomainResource!.id) : ''
+output emailFromAddress string = computedEmailFromAddress
+output keyVaultName string = keyVault.name

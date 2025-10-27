@@ -5,7 +5,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.38.33.27573",
-      "templateHash": "7948921724413690943"
+      "templateHash": "4493377169778725531"
     }
   },
   "parameters": {
@@ -115,18 +115,43 @@
     },
     "smtpSecretName": {
       "type": "string",
+      "defaultValue": "PDS-SMTP-URL",
       "minLength": 1,
       "maxLength": 127,
       "metadata": {
         "description": "Name of the Key Vault secret containing the SMTP connection string or password."
       }
     },
+    "emailFromAddressSecretName": {
+      "type": "string",
+      "defaultValue": "PDS-EMAIL-FROM-ADDRESS",
+      "minLength": 1,
+      "maxLength": 127,
+      "metadata": {
+        "description": "Name of the Key Vault secret containing the computed email from address."
+      }
+    },
     "emailFromAddress": {
       "type": "string",
-      "minLength": 5,
+      "defaultValue": "",
       "maxLength": 320,
       "metadata": {
-        "description": "From address to use when PDS sends email."
+        "description": "From address to use when PDS sends email. Leave empty to auto-use Azure-managed domain when enableCommunicationServices=true."
+      }
+    },
+    "enableCommunicationServices": {
+      "type": "bool",
+      "defaultValue": true,
+      "metadata": {
+        "description": "Whether to provision Azure Communication Services for email sending."
+      }
+    },
+    "emailCustomDomain": {
+      "type": "string",
+      "defaultValue": "",
+      "maxLength": 253,
+      "metadata": {
+        "description": "Custom domain name for Azure Communication Services Email (e.g. notify.example.com). Leave empty to use Azure-managed domain."
       }
     },
     "adminObjectId": {
@@ -196,6 +221,20 @@
       "metadata": {
         "description": "Base date for schedule calculation."
       }
+    },
+    "backupRunbookContentUri": {
+      "type": "string",
+      "defaultValue": "https://raw.githubusercontent.com/bluesky-social/azure-pds/main/scripts/runbooks/BackupPdsFiles.ps1",
+      "metadata": {
+        "description": "URI hosting the Automation runbook PowerShell script."
+      }
+    },
+    "backupRunbookContentHash": {
+      "type": "string",
+      "defaultValue": "40b3063d62778cebaf5390b6fdfaf2e2d9f9470a7e838e7615676ca273b6656d",
+      "metadata": {
+        "description": "SHA256 hash of the Automation runbook script content."
+      }
     }
   },
   "variables": {
@@ -204,6 +243,7 @@
     "cleanedNamePrefix": "[replace(format('{0}{1}', parameters('namePrefix'), uniqueString(resourceGroup().id)), '-', '')]",
     "storageAccountName": "[toLower(if(greater(length(variables('cleanedNamePrefix')), 24), substring(variables('cleanedNamePrefix'), 0, 24), variables('cleanedNamePrefix')))]",
     "containerAppName": "[format('{0}-pds-app', parameters('namePrefix'))]",
+    "containerAppIdentityName": "[format('{0}-pds-id', parameters('namePrefix'))]",
     "keyVaultName": "[format('{0}-{1}-kv', parameters('namePrefix'), uniqueString(resourceGroup().id))]",
     "logAnalyticsName": "[format('{0}-law', parameters('namePrefix'))]",
     "managedEnvName": "[format('{0}-cae', parameters('namePrefix'))]",
@@ -213,9 +253,33 @@
     "fileShareName": "pds",
     "storageShareStorageName": "pdsfiles",
     "storageAccountKeySecretName": "storage-account-key",
-    "backupRunbookScript": "param(\n    [Parameter(Mandatory=$true)]\n    [string]$StorageAccountName,\n    \n    [Parameter(Mandatory=$true)]\n    [string]$ShareName,\n    \n    [Parameter(Mandatory=$true)]\n    [int]$RetentionDays,\n    \n    [Parameter(Mandatory=$true)]\n    [string]$ResourceGroupName\n)\n\nWrite-Output \"Starting backup process for storage account: $StorageAccountName, share: $ShareName\"\n\ntry {\n    # Connect using managed identity\n    Connect-AzAccount -Identity\n    \n    # Get storage account context\n    $storageAccount = Get-AzStorageAccount -ResourceGroupName $ResourceGroupName -Name $StorageAccountName\n    $ctx = $storageAccount.Context\n    \n    # Create snapshot with timestamp\n    $timestamp = Get-Date -Format \"yyyyMMdd-HHmmss\"\n    $snapshotName = \"backup-$timestamp\"\n    \n    Write-Output \"Creating snapshot: $snapshotName\"\n    $snapshot = New-AzStorageShare -Name $ShareName -Context $ctx -Snapshot\n    \n    Write-Output \"Snapshot created successfully: $($snapshot.SnapshotTime)\"\n    \n    # Clean up old snapshots\n    Write-Output \"Cleaning up snapshots older than $RetentionDays days\"\n    $cutoffDate = (Get-Date).AddDays(-$RetentionDays)\n    \n    $allSnapshots = Get-AzStorageShare -Name $ShareName -Context $ctx -IncludeSnapshot\n    $oldSnapshots = $allSnapshots | Where-Object { $_.IsSnapshot -and $_.SnapshotTime -lt $cutoffDate }\n    \n    foreach ($oldSnapshot in $oldSnapshots) {\n        Write-Output \"Removing old snapshot from: $($oldSnapshot.SnapshotTime)\"\n        Remove-AzStorageShare -Share $oldSnapshot -Force\n    }\n    \n    Write-Output \"Backup process completed successfully\"\n}\ncatch {\n    Write-Error \"Backup failed: $($_.Exception.Message)\"\n    throw\n}\n"
+    "communicationServiceName": "[format('{0}-acs', parameters('namePrefix'))]",
+    "emailServiceName": "[format('{0}-email', parameters('namePrefix'))]",
+    "hasEmailFromOverride": "[greater(length(parameters('emailFromAddress')), 0)]",
+    "includeSmtpSecret": "[greater(length(parameters('smtpSecretName')), 0)]",
+    "maintenanceParts": "[split(parameters('maintenanceWindow'), ' ')]",
+    "maintenanceTimePart": "[if(greater(length(variables('maintenanceParts')), 1), variables('maintenanceParts')[1], parameters('maintenanceWindow'))]",
+    "maintenanceTimeSegments": "[split(variables('maintenanceTimePart'), ':')]",
+    "maintenanceHour": "[padLeft(variables('maintenanceTimeSegments')[0], 2, '0')]",
+    "maintenanceMinute": "[padLeft(if(greater(length(variables('maintenanceTimeSegments')), 1), variables('maintenanceTimeSegments')[1], '00'), 2, '0')]",
+    "scheduleStartTime": "[dateTimeAdd(format('{0}T{1}:{2}:00.000Z', parameters('baseDateTime'), variables('maintenanceHour'), variables('maintenanceMinute')), 'P2D')]",
+    "computedEmailFromAddress": "[if(variables('hasEmailFromOverride'), parameters('emailFromAddress'), if(and(parameters('enableCommunicationServices'), not(equals(parameters('emailCustomDomain'), ''))), format('donotreply@{0}', parameters('emailCustomDomain')), if(parameters('enableCommunicationServices'), 'donotreply@placeholder.azurecomm.net', 'donotreply@example.com')))]",
+    "smtpPlaceholderValue": "smtps://pending-update@smtp.azurecomm.net:587",
+    "backupRunbookContentLink": {
+      "uri": "[parameters('backupRunbookContentUri')]",
+      "contentHash": {
+        "algorithm": "sha256",
+        "value": "[parameters('backupRunbookContentHash')]"
+      }
+    }
   },
   "resources": [
+    {
+      "type": "Microsoft.ManagedIdentity/userAssignedIdentities",
+      "apiVersion": "2018-11-30",
+      "name": "[variables('containerAppIdentityName')]",
+      "location": "[parameters('location')]"
+    },
     {
       "type": "Microsoft.OperationalInsights/workspaces",
       "apiVersion": "2022-10-01",
@@ -333,7 +397,10 @@
       "name": "[variables('containerAppName')]",
       "location": "[parameters('location')]",
       "identity": {
-        "type": "SystemAssigned"
+        "type": "UserAssigned",
+        "userAssignedIdentities": {
+          "[format('{0}', resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('containerAppIdentityName')))]": {}
+        }
       },
       "properties": {
         "managedEnvironmentId": "[resourceId('Microsoft.App/managedEnvironments', variables('managedEnvName'))]",
@@ -351,28 +418,7 @@
               }
             ]
           },
-          "secrets": [
-            {
-              "name": "pds-jwt-secret",
-              "keyVaultUrl": "[format('{0}secrets/{1}', reference(resourceId('Microsoft.KeyVault/vaults', variables('keyVaultName')), '2023-07-01').vaultUri, parameters('pdsJwtSecretName'))]",
-              "identity": "system"
-            },
-            {
-              "name": "pds-admin-password",
-              "keyVaultUrl": "[format('{0}secrets/{1}', reference(resourceId('Microsoft.KeyVault/vaults', variables('keyVaultName')), '2023-07-01').vaultUri, parameters('pdsAdminPasswordSecretName'))]",
-              "identity": "system"
-            },
-            {
-              "name": "pds-plc-key",
-              "keyVaultUrl": "[format('{0}secrets/{1}', reference(resourceId('Microsoft.KeyVault/vaults', variables('keyVaultName')), '2023-07-01').vaultUri, parameters('pdsPlcRotationKeySecretName'))]",
-              "identity": "system"
-            },
-            {
-              "name": "pds-smtp-secret",
-              "keyVaultUrl": "[format('{0}secrets/{1}', reference(resourceId('Microsoft.KeyVault/vaults', variables('keyVaultName')), '2023-07-01').vaultUri, parameters('smtpSecretName'))]",
-              "identity": "system"
-            }
-          ]
+          "secrets": "[concat(createArray(createObject('name', 'pds-jwt-secret', 'keyVaultUrl', format('{0}secrets/{1}', reference(resourceId('Microsoft.KeyVault/vaults', variables('keyVaultName')), '2023-07-01').vaultUri, parameters('pdsJwtSecretName')), 'identity', 'userAssigned'), createObject('name', 'pds-admin-password', 'keyVaultUrl', format('{0}secrets/{1}', reference(resourceId('Microsoft.KeyVault/vaults', variables('keyVaultName')), '2023-07-01').vaultUri, parameters('pdsAdminPasswordSecretName')), 'identity', 'userAssigned'), createObject('name', 'pds-plc-key', 'keyVaultUrl', format('{0}secrets/{1}', reference(resourceId('Microsoft.KeyVault/vaults', variables('keyVaultName')), '2023-07-01').vaultUri, parameters('pdsPlcRotationKeySecretName')), 'identity', 'userAssigned'), createObject('name', 'pds-email-from-address', 'keyVaultUrl', format('{0}secrets/{1}', reference(resourceId('Microsoft.KeyVault/vaults', variables('keyVaultName')), '2023-07-01').vaultUri, parameters('emailFromAddressSecretName')), 'identity', 'userAssigned')), if(variables('includeSmtpSecret'), createArray(createObject('name', 'pds-smtp-secret', 'keyVaultUrl', format('{0}secrets/{1}', reference(resourceId('Microsoft.KeyVault/vaults', variables('keyVaultName')), '2023-07-01').vaultUri, parameters('smtpSecretName')), 'identity', 'userAssigned')), createArray()))]"
         },
         "template": {
           "revisionSuffix": "[toLower(format('r{0}', uniqueString(variables('pdsImage'))))]",
@@ -414,56 +460,7 @@
                   "mountPath": "/pds"
                 }
               ],
-              "env": [
-                {
-                  "name": "PDS_PORT",
-                  "value": "2583"
-                },
-                {
-                  "name": "PDS_HOSTNAME",
-                  "value": "[parameters('pdsHostname')]"
-                },
-                {
-                  "name": "PDS_DATA_DIRECTORY",
-                  "value": "/pds"
-                },
-                {
-                  "name": "PDS_ACTOR_STORE_DIRECTORY",
-                  "value": "/pds/actors"
-                },
-                {
-                  "name": "PDS_BLOBSTORE_DISK_LOCATION",
-                  "value": "/pds/blobs"
-                },
-                {
-                  "name": "PDS_BLOBSTORE_DISK_TMP_LOCATION",
-                  "value": "/pds/blobs/tmp"
-                },
-                {
-                  "name": "PDS_SQLITE_DISABLE_WAL_AUTO_CHECKPOINT",
-                  "value": "true"
-                },
-                {
-                  "name": "PDS_EMAIL_FROM_ADDRESS",
-                  "value": "[parameters('emailFromAddress')]"
-                },
-                {
-                  "name": "PDS_JWT_SECRET",
-                  "secretRef": "pds-jwt-secret"
-                },
-                {
-                  "name": "PDS_ADMIN_PASSWORD",
-                  "secretRef": "pds-admin-password"
-                },
-                {
-                  "name": "PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX",
-                  "secretRef": "pds-plc-key"
-                },
-                {
-                  "name": "PDS_EMAIL_SMTP_URL",
-                  "secretRef": "pds-smtp-secret"
-                }
-              ]
+              "env": "[concat(createArray(createObject('name', 'PDS_PORT', 'value', '2583'), createObject('name', 'PDS_HOSTNAME', 'value', parameters('pdsHostname')), createObject('name', 'PDS_DATA_DIRECTORY', 'value', '/pds'), createObject('name', 'PDS_ACTOR_STORE_DIRECTORY', 'value', '/pds/actors'), createObject('name', 'PDS_BLOBSTORE_DISK_LOCATION', 'value', '/pds/blobs'), createObject('name', 'PDS_BLOBSTORE_DISK_TMP_LOCATION', 'value', '/pds/blobs/tmp'), createObject('name', 'PDS_SQLITE_DISABLE_WAL_AUTO_CHECKPOINT', 'value', 'true'), createObject('name', 'PDS_EMAIL_FROM_ADDRESS', 'secretRef', 'pds-email-from-address'), createObject('name', 'PDS_JWT_SECRET', 'secretRef', 'pds-jwt-secret'), createObject('name', 'PDS_ADMIN_PASSWORD', 'secretRef', 'pds-admin-password'), createObject('name', 'PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX', 'secretRef', 'pds-plc-key')), if(variables('includeSmtpSecret'), createArray(createObject('name', 'PDS_EMAIL_SMTP_URL', 'secretRef', 'pds-smtp-secret')), createArray()))]"
             }
           ],
           "scale": {
@@ -480,8 +477,12 @@
         }
       },
       "dependsOn": [
+        "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('containerAppIdentityName'))]",
+        "[resourceId('Microsoft.KeyVault/vaults/secrets', variables('keyVaultName'), parameters('emailFromAddressSecretName'))]",
         "[resourceId('Microsoft.KeyVault/vaults', variables('keyVaultName'))]",
+        "[resourceId('Microsoft.KeyVault/vaults/accessPolicies', variables('keyVaultName'), 'add')]",
         "[resourceId('Microsoft.App/managedEnvironments', variables('managedEnvName'))]",
+        "[resourceId('Microsoft.KeyVault/vaults/secrets', variables('keyVaultName'), parameters('smtpSecretName'))]",
         "[resourceId('Microsoft.App/managedEnvironments/storages', variables('managedEnvName'), variables('storageShareStorageName'))]"
       ]
     },
@@ -493,7 +494,7 @@
         "accessPolicies": [
           {
             "tenantId": "[variables('tenantId')]",
-            "objectId": "[reference(resourceId('Microsoft.App/containerApps', variables('containerAppName')), '2023-05-01', 'full').identity.principalId]",
+            "objectId": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('containerAppIdentityName')), '2018-11-30').principalId]",
             "permissions": {
               "secrets": [
                 "get",
@@ -504,7 +505,7 @@
         ]
       },
       "dependsOn": [
-        "[resourceId('Microsoft.App/containerApps', variables('containerAppName'))]",
+        "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('containerAppIdentityName'))]",
         "[resourceId('Microsoft.KeyVault/vaults', variables('keyVaultName'))]"
       ]
     },
@@ -553,7 +554,8 @@
         "runbookType": "PowerShell",
         "description": "Creates daily snapshots of the PDS Azure Files share and manages retention",
         "publishContentLink": {
-          "uri": "[format('data:text/plain;base64,{0}', base64(variables('backupRunbookScript')))]"
+          "uri": "[variables('backupRunbookContentLink').uri]",
+          "contentHash": "[variables('backupRunbookContentLink').contentHash]"
         }
       },
       "dependsOn": [
@@ -565,15 +567,10 @@
       "apiVersion": "2023-11-01",
       "name": "[format('{0}/{1}', variables('automationAccountName'), variables('scheduleName'))]",
       "properties": {
-        "frequency": "Week",
+        "frequency": "Day",
         "interval": 1,
-        "startTime": "[dateTimeAdd(format('{0}T{1}:00.000Z', parameters('baseDateTime'), split(parameters('maintenanceWindow'), ' ')[1]), 'P2D')]",
+        "startTime": "[variables('scheduleStartTime')]",
         "timeZone": "UTC",
-        "advancedSchedule": {
-          "weekDays": [
-            "[if(equals(split(parameters('maintenanceWindow'), ' ')[0], 'Sun'), 'Sunday', if(equals(split(parameters('maintenanceWindow'), ' ')[0], 'Mon'), 'Monday', if(equals(split(parameters('maintenanceWindow'), ' ')[0], 'Tue'), 'Tuesday', if(equals(split(parameters('maintenanceWindow'), ' ')[0], 'Wed'), 'Wednesday', if(equals(split(parameters('maintenanceWindow'), ' ')[0], 'Thu'), 'Thursday', if(equals(split(parameters('maintenanceWindow'), ' ')[0], 'Fri'), 'Friday', 'Saturday'))))))]"
-          ]
-        },
         "description": "Daily backup schedule for PDS files"
       },
       "dependsOn": [
@@ -609,7 +606,7 @@
       "type": "Microsoft.Authorization/roleAssignments",
       "apiVersion": "2022-04-01",
       "scope": "[format('Microsoft.Storage/storageAccounts/{0}', variables('storageAccountName'))]",
-      "name": "[guid(resourceId('Microsoft.Storage/storageAccounts', variables('storageAccountName')), resourceId('Microsoft.Automation/automationAccounts', variables('automationAccountName')), 'ba92f5b4-2d11-453d-a403-e96b0029c9fe')]",
+      "name": "[guid(resourceId('Microsoft.Storage/storageAccounts', variables('storageAccountName')), resourceId('Microsoft.Automation/automationAccounts', variables('automationAccountName')), 'ba92f5b4-2d11-453d-a403-e96b0029c9fe', 'storage')]",
       "properties": {
         "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'ba92f5b4-2d11-453d-a403-e96b0029c9fe')]",
         "principalId": "[reference(resourceId('Microsoft.Automation/automationAccounts', variables('automationAccountName')), '2023-11-01', 'full').identity.principalId]",
@@ -636,7 +633,7 @@
       "type": "Microsoft.Authorization/roleAssignments",
       "apiVersion": "2022-04-01",
       "scope": "[format('Microsoft.KeyVault/vaults/{0}', variables('keyVaultName'))]",
-      "name": "[guid(resourceId('Microsoft.KeyVault/vaults', variables('keyVaultName')), resourceId('Microsoft.Automation/automationAccounts', variables('automationAccountName')), '4633458b-17de-408a-b874-0445c86b69e6')]",
+      "name": "[guid(resourceId('Microsoft.KeyVault/vaults', variables('keyVaultName')), resourceId('Microsoft.Automation/automationAccounts', variables('automationAccountName')), '4633458b-17de-408a-b874-0445c86b69e6', 'automation')]",
       "properties": {
         "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '4633458b-17de-408a-b874-0445c86b69e6')]",
         "principalId": "[reference(resourceId('Microsoft.Automation/automationAccounts', variables('automationAccountName')), '2023-11-01', 'full').identity.principalId]",
@@ -651,15 +648,69 @@
       "type": "Microsoft.Authorization/roleAssignments",
       "apiVersion": "2022-04-01",
       "scope": "[format('Microsoft.KeyVault/vaults/{0}', variables('keyVaultName'))]",
-      "name": "[guid(resourceId('Microsoft.KeyVault/vaults', variables('keyVaultName')), resourceId('Microsoft.App/containerApps', variables('containerAppName')), '4633458b-17de-408a-b874-0445c86b69e6')]",
+      "name": "[guid(resourceId('Microsoft.KeyVault/vaults', variables('keyVaultName')), resourceId('Microsoft.App/containerApps', variables('containerAppName')), '4633458b-17de-408a-b874-0445c86b69e6', 'containerapp')]",
       "properties": {
         "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '4633458b-17de-408a-b874-0445c86b69e6')]",
-        "principalId": "[reference(resourceId('Microsoft.App/containerApps', variables('containerAppName')), '2023-05-01', 'full').identity.principalId]",
+        "principalId": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('containerAppIdentityName')), '2018-11-30').principalId]",
         "principalType": "ServicePrincipal"
       },
       "dependsOn": [
         "[resourceId('Microsoft.App/containerApps', variables('containerAppName'))]",
+        "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('containerAppIdentityName'))]",
         "[resourceId('Microsoft.KeyVault/vaults', variables('keyVaultName'))]"
+      ]
+    },
+    {
+      "condition": "[parameters('enableCommunicationServices')]",
+      "type": "Microsoft.Communication/emailServices",
+      "apiVersion": "2023-04-01",
+      "name": "[variables('emailServiceName')]",
+      "location": "global",
+      "properties": {
+        "dataLocation": "United States"
+      }
+    },
+    {
+      "condition": "[and(parameters('enableCommunicationServices'), equals(parameters('emailCustomDomain'), ''))]",
+      "type": "Microsoft.Communication/emailServices/domains",
+      "apiVersion": "2023-04-01",
+      "name": "[format('{0}/{1}', variables('emailServiceName'), 'AzureManagedDomain')]",
+      "location": "global",
+      "properties": {
+        "domainManagement": "AzureManaged"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Communication/emailServices', variables('emailServiceName'))]"
+      ]
+    },
+    {
+      "condition": "[and(parameters('enableCommunicationServices'), not(equals(parameters('emailCustomDomain'), '')))]",
+      "type": "Microsoft.Communication/emailServices/domains",
+      "apiVersion": "2023-04-01",
+      "name": "[format('{0}/{1}', variables('emailServiceName'), parameters('emailCustomDomain'))]",
+      "location": "global",
+      "properties": {
+        "domainManagement": "CustomerManaged"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Communication/emailServices', variables('emailServiceName'))]"
+      ]
+    },
+    {
+      "condition": "[parameters('enableCommunicationServices')]",
+      "type": "Microsoft.Communication/communicationServices",
+      "apiVersion": "2023-04-01",
+      "name": "[variables('communicationServiceName')]",
+      "location": "global",
+      "properties": {
+        "dataLocation": "United States",
+        "linkedDomains": [
+          "[if(equals(parameters('emailCustomDomain'), ''), resourceId('Microsoft.Communication/emailServices/domains', variables('emailServiceName'), 'AzureManagedDomain'), resourceId('Microsoft.Communication/emailServices/domains', variables('emailServiceName'), parameters('emailCustomDomain')))]"
+        ]
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Communication/emailServices/domains', variables('emailServiceName'), parameters('emailCustomDomain'))]",
+        "[resourceId('Microsoft.Communication/emailServices/domains', variables('emailServiceName'), 'AzureManagedDomain')]"
       ]
     },
     {
@@ -668,6 +719,29 @@
       "apiVersion": "2023-07-01-preview",
       "name": "[parameters('dnsZoneName')]",
       "location": "global"
+    },
+    {
+      "type": "Microsoft.KeyVault/vaults/secrets",
+      "apiVersion": "2023-07-01",
+      "name": "[format('{0}/{1}', variables('keyVaultName'), parameters('emailFromAddressSecretName'))]",
+      "properties": {
+        "value": "[variables('computedEmailFromAddress')]"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.KeyVault/vaults', variables('keyVaultName'))]"
+      ]
+    },
+    {
+      "condition": "[parameters('enableCommunicationServices')]",
+      "type": "Microsoft.KeyVault/vaults/secrets",
+      "apiVersion": "2023-07-01",
+      "name": "[format('{0}/{1}', variables('keyVaultName'), parameters('smtpSecretName'))]",
+      "properties": {
+        "value": "[variables('smtpPlaceholderValue')]"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.KeyVault/vaults', variables('keyVaultName'))]"
+      ]
     },
     {
       "condition": "[not(equals(parameters('dnsZoneName'), ''))]",
@@ -734,6 +808,38 @@
     "backupScheduleName": {
       "type": "string",
       "value": "[variables('scheduleName')]"
+    },
+    "communicationServiceEndpoint": {
+      "type": "string",
+      "value": "[if(parameters('enableCommunicationServices'), reference(resourceId('Microsoft.Communication/communicationServices', variables('communicationServiceName')), '2023-04-01').hostName, '')]"
+    },
+    "emailServiceName": {
+      "type": "string",
+      "value": "[if(parameters('enableCommunicationServices'), variables('emailServiceName'), '')]"
+    },
+    "smtpServer": {
+      "type": "string",
+      "value": "smtp.azurecomm.net"
+    },
+    "smtpPort": {
+      "type": "int",
+      "value": 587
+    },
+    "communicationServiceResourceId": {
+      "type": "string",
+      "value": "[if(parameters('enableCommunicationServices'), resourceId('Microsoft.Communication/communicationServices', variables('communicationServiceName')), '')]"
+    },
+    "emailDomainResourceId": {
+      "type": "string",
+      "value": "[if(parameters('enableCommunicationServices'), if(equals(parameters('emailCustomDomain'), ''), resourceId('Microsoft.Communication/emailServices/domains', variables('emailServiceName'), 'AzureManagedDomain'), resourceId('Microsoft.Communication/emailServices/domains', variables('emailServiceName'), parameters('emailCustomDomain'))), '')]"
+    },
+    "emailFromAddress": {
+      "type": "string",
+      "value": "[variables('computedEmailFromAddress')]"
+    },
+    "keyVaultName": {
+      "type": "string",
+      "value": "[variables('keyVaultName')]"
     }
   }
 }
