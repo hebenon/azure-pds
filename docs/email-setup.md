@@ -45,10 +45,10 @@ Deploy the infrastructure with Communication Services enabled, then run the SMTP
 ```bash
 # Deploy with Azure-managed domain (infrastructure only)
 az deployment group create \
-  --resource-group mensmachina \
+  --resource-group example \
   --template-file infra/main.bicep \
   --parameters namePrefix=pds \
-               pdsHostname=pds.mensmachina.com \
+               pdsHostname=pds.example.com \
                pdsImageTag=0.4 \
                enableCommunicationServices=true \
                adminObjectId=your-admin-object-id \
@@ -56,27 +56,27 @@ az deployment group create \
                pdsAdminPasswordSecretName=PDS-ADMIN-PASSWORD \
                pdsPlcRotationKeySecretName=PDS-PLC-ROTATION-KEY-K256-PRIVATE-KEY-HEX \
                smtpSecretName=PDS-SMTP-URL \
-               dnsZoneName=mensmachina.com
+               dnsZoneName=example.com
 
 # Custom domain deployment (requires DNS/verification)
 az deployment group create \
-  --resource-group mensmachina \
+  --resource-group example \
   --template-file infra/main.bicep \
   --parameters namePrefix=pds \
-               pdsHostname=pds.mensmachina.com \
+               pdsHostname=pds.example.com \
                pdsImageTag=0.4 \
                enableCommunicationServices=true \
-               emailCustomDomain=notify.mensmachina.com \
+               emailCustomDomain=notify.example.com \
                adminObjectId=your-admin-object-id \
                pdsJwtSecretName=PDS-JWT-SECRET \
                pdsAdminPasswordSecretName=PDS-ADMIN-PASSWORD \
                pdsPlcRotationKeySecretName=PDS-PLC-ROTATION-KEY-K256-PRIVATE-KEY-HEX \
                smtpSecretName=PDS-SMTP-URL \
-               dnsZoneName=mensmachina.com
+               dnsZoneName=example.com
 
 # After the deployment succeeds (and the domain shows Verified), populate SMTP credentials
 ./scripts/acs-smtp-setup.sh \
-  --resource-group mensmachina \
+  --resource-group example \
   --communication-service pds-acs \
   --email-service pds-email \
   --key-vault <name from deployment output> \
@@ -202,7 +202,7 @@ Monitor PDS logs for email sending:
 # View Container App logs
 az containerapp logs show \
   --name pds-pds-app \
-  --resource-group mensmachina \
+  --resource-group example \
   --follow
 ```
 
@@ -230,12 +230,12 @@ az containerapp logs show \
 
 ```bash
 # Check Communication Services status
-az communication list --resource-group mensmachina
+az communication list --resource-group example
 
 # Check Email Service domains
 az communication email domain list \
   --email-service-name pds-email \
-  --resource-group mensmachina
+  --resource-group example
 
 # Verify Key Vault secret
 az keyvault secret show \
@@ -246,7 +246,7 @@ az keyvault secret show \
 # Inspect SMTP username bindings
 az communication smtp-username list \
   --comm-service-name pds-acs \
-  --resource-group mensmachina
+  --resource-group example
 ```
 
 ## Cost Optimization
