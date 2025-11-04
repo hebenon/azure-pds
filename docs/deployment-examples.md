@@ -45,8 +45,10 @@ az deployment group create \
     dnsZoneName=example.com \
     dnsRecordName=pds \
     logAnalyticsRetentionDays=90 \
-    fileShareQuotaGiB=512 \
-    backupRetentionDays=90
+    snapshotContainerName=pds-sqlite \
+    snapshotPrefix=snapshots \
+    backupIntervalSeconds=15 \
+    backupRetentionCount=400
 ```
 
 ## External SMTP Provider (No Communication Services)
@@ -90,9 +92,11 @@ az deployment group create \
     pdsMemory=0.5Gi \
     minReplicas=0 \
     maxReplicas=1 \
-    fileShareQuotaGiB=50 \
     logAnalyticsRetentionDays=7 \
-    backupRetentionDays=7
+    snapshotContainerName=pds-dev-sqlite \
+    snapshotPrefix=snapshots \
+    backupIntervalSeconds=30 \
+    backupRetentionCount=50
 ```
 
 > **Note**: Development deployments automatically use Azure-managed email domains for simplicity.
@@ -118,12 +122,11 @@ az deployment group create \
 | `pdsMemory` | No | PDS container memory request | `1Gi` |
 | `minReplicas` | No | Minimum container replicas | `1` |
 | `maxReplicas` | No | Maximum container replicas | `2` |
-| `fileShareQuotaGiB` | No | Azure Files quota in GiB | `256` |
 | `logAnalyticsRetentionDays` | No | Log retention days | `30` |
-| `backupRetentionDays` | No | Backup retention days | `30` |
-| `backupRunbookContentUri` | No | URI for the Automation runbook script (override when deploying from a branch) | `https://raw.githubusercontent.com/...` |
-| `backupRunbookContentHash` | No | SHA256 hash of the runbook script content | `40b3...` |
-| `maintenanceWindow` | No | Daily backup trigger time (UTC) | `Sun 02:00` |
+| `snapshotContainerName` | No | Blob container name for snapshot archives | `pds-sqlite` |
+| `snapshotPrefix` | No | Blob prefix where archives are written | `snapshots` |
+| `backupIntervalSeconds` | No | Seconds between snapshot uploads | `15` |
+| `backupRetentionCount` | No | Number of archives to retain | `200` |
 
 ## Finding Your Admin Object ID
 
@@ -142,7 +145,7 @@ az ad sp show --id <app-id> --query id --output tsv
 
 ### Development
 - Use smaller resource allocations (`pdsCpu`, `pdsMemory`)
-- Shorter retention periods (`logAnalyticsRetentionDays`, `backupRetentionDays`)
+- Shorter retention targets (`logAnalyticsRetentionDays`, `backupRetentionCount`)
 - Lower replica counts (`minReplicas=0`, `maxReplicas=1`)
 - Azure-managed email domain for simplicity
 
@@ -165,7 +168,7 @@ Some parameters may need adjustment for different Azure regions:
 
 - **Location**: Ensure Container Apps and Communication Services are available
 - **Data Residency**: Communication Services `dataLocation` for compliance
-- **Backup Windows**: Adjust `maintenanceWindow` for local time zones
+- **Snapshot Cadence**: Tune `backupIntervalSeconds` and `backupRetentionCount` for compliance and network constraints
 - **Compliance**: Check regional requirements for data retention periods
 
 ## Next Steps

@@ -16,8 +16,11 @@ param pdsHostname string
 @maxLength(128)
 param pdsImageTag string
 
-@description('Optional override for the Caddy container image.')
-param caddyImage string = 'caddy:2'
+@description('Optional name of a Container Apps certificate resource (within the managed environment) to bind to the ingress. Leave empty to skip automatic binding.')
+param ingressCertificateName string = ''
+
+@description('Whether to let Azure Container Apps request and renew a managed certificate when no existing certificate name is provided.')
+param enableManagedCertificate bool = true
 
 @description('CPU request for the PDS container in cores.')
 param pdsCpu string = '0.5'
@@ -25,11 +28,8 @@ param pdsCpu string = '0.5'
 @description('Memory request for the PDS container.')
 param pdsMemory string = '1Gi'
 
-@description('CPU request for the Caddy container in cores.')
-param caddyCpu string = '0.25'
-
-@description('Memory request for the Caddy container.')
-param caddyMemory string = '0.5Gi'
+@description('Whether to allow unauthenticated HTTP (port 80) alongside HTTPS.')
+param enableHttp bool = true
 
 @description('Minimum number of replicas the container app should maintain.')
 param minReplicas int = 1
@@ -78,11 +78,6 @@ param emailCustomDomain string = ''
 @maxLength(36)
 param adminObjectId string
 
-@description('Quota in GiB allocated to the Azure Files share that stores PDS state.')
-@minValue(1)
-@maxValue(102400)
-param fileShareQuotaGiB int = 256
-
 @description('Optional DNS zone name (e.g. example.com). Leave empty to skip DNS record creation.')
 @maxLength(253)
 param dnsZoneName string = ''
@@ -97,24 +92,40 @@ param dnsRecordName string = 'pds'
 @maxValue(730)
 param logAnalyticsRetentionDays int = 30
 
-@description('Maintenance window for backup operations (e.g., "Sun 02:00").')
-@minLength(7)
-@maxLength(10)
-param maintenanceWindow string = 'Sun 02:00'
+@description('Name of the blob container used to store SQLite snapshot archives.')
+@minLength(3)
+@maxLength(63)
+param snapshotContainerName string = 'pds-sqlite'
 
-@description('Retention in days for Azure Files snapshots.')
-@minValue(7)
-@maxValue(365)
-param backupRetentionDays int = 30
+@description('Prefix applied to snapshot blob paths.')
+@minLength(1)
+param snapshotPrefix string = 'snapshots'
 
-@description('Base date for schedule calculation.')
-param baseDateTime string = utcNow('yyyy-MM-dd')
+@description('Interval in seconds between snapshot uploads.')
+@minValue(5)
+param backupIntervalSeconds int = 15
 
-@description('URI hosting the Automation runbook PowerShell script.')
-param backupRunbookContentUri string = 'https://raw.githubusercontent.com/bluesky-social/azure-pds/main/scripts/runbooks/BackupPdsFiles.ps1'
+@description('Number of snapshot archives to retain in object storage.')
+@minValue(10)
+param backupRetentionCount int = 200
 
-@description('SHA256 hash of the Automation runbook script content.')
-param backupRunbookContentHash string = '40b3063d62778cebaf5390b6fdfaf2e2d9f9470a7e838e7615676ca273b6656d'
+@description('URL for the PLC directory service.')
+param pdsDidPlcUrl string = 'https://plc.directory'
+
+@description('URL for the Bluesky API service.')
+param pdsBskyAppViewUrl string = 'https://api.bsky.app'
+
+@description('DID for the Bluesky API service.')
+param pdsBskyAppViewDid string = 'did:web:api.bsky.app'
+
+@description('URL for the Bluesky report service.')
+param pdsReportServiceUrl string = 'https://mod.bsky.app'
+
+@description('DID for the Bluesky report service.')
+param pdsReportServiceDid string = 'did:plc:ar7c4by46qjdydhdevvrndac'
+
+@description('Crawlers to whitelist for indexing (comma-separated URLs).')
+param pdsCrawlers string = 'https://bsky.network'
 
 var tenantId = subscription().tenantId
 var pdsImage = 'ghcr.io/bluesky-social/pds:${pdsImageTag}'
@@ -125,32 +136,43 @@ var containerAppIdentityName = '${namePrefix}-pds-id'
 var keyVaultName = '${namePrefix}-${uniqueString(resourceGroup().id)}-kv'
 var logAnalyticsName = '${namePrefix}-law'
 var managedEnvName = '${namePrefix}-cae'
-var automationAccountName = '${namePrefix}-auto'
-var runbookName = 'BackupPdsFiles'
-var scheduleName = 'DailyBackupSchedule'
-var fileShareName = 'pds'
-var storageShareStorageName = 'pdsfiles'
+var hasIngressCertificate = length(ingressCertificateName) > 0
+var useManagedCertificate = !hasIngressCertificate && enableManagedCertificate
+var managedCertificateEnabled = useManagedCertificate && dnsZoneName != ''
+var managedCertificateName = '${namePrefix}-pds-managed-cert'
+var ingressCertificateResourceId = hasIngressCertificate ? resourceId('Microsoft.App/managedEnvironments/certificates', managedEnvName, ingressCertificateName) : ''
+var managedCertificateResourceId = managedCertificateEnabled ? resourceId('Microsoft.App/managedEnvironments/managedCertificates', managedEnvName, managedCertificateName) : ''
+var ingressCustomDomains = hasIngressCertificate ? [
+  {
+    name: pdsHostname
+    certificateId: ingressCertificateResourceId
+    bindingType: 'SniEnabled'
+  }
+] : []
+
 var storageAccountKeySecretName = 'storage-account-key'
 var communicationServiceName = '${namePrefix}-acs'
 var emailServiceName = '${namePrefix}-email'
 var hasEmailFromOverride = length(emailFromAddress) > 0
 var includeSmtpSecret = length(smtpSecretName) > 0
-var maintenanceParts = split(maintenanceWindow, ' ')
-var maintenanceTimePart = length(maintenanceParts) > 1 ? maintenanceParts[1] : maintenanceWindow
-var maintenanceTimeSegments = split(maintenanceTimePart, ':')
-var maintenanceHour = padLeft(maintenanceTimeSegments[0], 2, '0')
-var maintenanceMinute = padLeft(length(maintenanceTimeSegments) > 1 ? maintenanceTimeSegments[1] : '00', 2, '0')
-var scheduleStartTime = dateTimeAdd('${baseDateTime}T${maintenanceHour}:${maintenanceMinute}:00.000Z', 'P2D')
-// Compute the email from address based on configuration
+var containerAppDependencies = enableCommunicationServices ? [
+  containerAppIdentity
+  emailFromAddressSecret
+  kvPolicyApp
+  managedEnvironment
+  storageAccount
+  smtpSecretSeed
+] : [
+  containerAppIdentity
+  emailFromAddressSecret
+  kvPolicyApp
+  managedEnvironment
+  storageAccount
+]
+var backupRestoreScriptContent = loadTextContent('../scripts/pds-backup/restore.sh')
+var backupLoopScriptContent = loadTextContent('../scripts/pds-backup/backup-loop.sh')
 var computedEmailFromAddress = hasEmailFromOverride ? emailFromAddress : enableCommunicationServices && emailCustomDomain != '' ? 'donotreply@${emailCustomDomain}' : enableCommunicationServices ? 'donotreply@placeholder.azurecomm.net' : 'donotreply@example.com'
 var smtpPlaceholderValue = 'smtps://pending-update@smtp.azurecomm.net:587'
-var backupRunbookContentLink = {
-  uri: backupRunbookContentUri
-  contentHash: {
-    algorithm: 'sha256'
-    value: backupRunbookContentHash
-  }
-}
 
 resource containerAppIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2018-11-30' = {
   name: containerAppIdentityName
@@ -185,19 +207,6 @@ resource managedEnvironment 'Microsoft.App/managedEnvironments@2023-05-01' = {
   }
 }
 
-resource storageMount 'Microsoft.App/managedEnvironments/storages@2023-05-01' = {
-  parent: managedEnvironment
-  name: storageShareStorageName
-  properties: {
-    azureFile: {
-      accountName: storageAccount.name
-      shareName: fileShareName
-      accessMode: 'ReadWrite'
-      accountKey: storageAccount.listKeys().keys[0].value
-    }
-  }
-}
-
 resource storageAccount 'Microsoft.Storage/storageAccounts@2022-09-01' = {
   name: storageAccountName
   location: location
@@ -214,11 +223,10 @@ resource storageAccount 'Microsoft.Storage/storageAccounts@2022-09-01' = {
   }
 }
 
-resource storageFileShare 'Microsoft.Storage/storageAccounts/fileServices/shares@2022-09-01' = {
-  name: '${storageAccount.name}/default/${fileShareName}'
+resource snapshotContainer 'Microsoft.Storage/storageAccounts/blobServices/containers@2022-09-01' = {
+  name: '${storageAccount.name}/default/${snapshotContainerName}'
   properties: {
-    shareQuota: fileShareQuotaGiB
-    enabledProtocols: 'SMB'
+    publicAccess: 'None'
   }
 }
 
@@ -268,8 +276,8 @@ resource containerApp 'Microsoft.App/containerApps@2023-05-01' = {
       activeRevisionsMode: 'Single'
       ingress: {
         external: true
-        targetPort: 443
-        allowInsecure: true
+        targetPort: 2583
+        allowInsecure: enableHttp
         transport: 'auto'
         traffic: [
           {
@@ -277,63 +285,44 @@ resource containerApp 'Microsoft.App/containerApps@2023-05-01' = {
             weight: 100
           }
         ]
+        customDomains: ingressCustomDomains
       }
       secrets: concat([
         {
           name: 'pds-jwt-secret'
           keyVaultUrl: '${keyVault.properties.vaultUri}secrets/${pdsJwtSecretName}'
-          identity: 'userAssigned'
+          identity: containerAppIdentity.id
         }
         {
           name: 'pds-admin-password'
           keyVaultUrl: '${keyVault.properties.vaultUri}secrets/${pdsAdminPasswordSecretName}'
-          identity: 'userAssigned'
+          identity: containerAppIdentity.id
         }
         {
           name: 'pds-plc-key'
           keyVaultUrl: '${keyVault.properties.vaultUri}secrets/${pdsPlcRotationKeySecretName}'
-          identity: 'userAssigned'
+          identity: containerAppIdentity.id
         }
         {
           name: 'pds-email-from-address'
           keyVaultUrl: '${keyVault.properties.vaultUri}secrets/${emailFromAddressSecretName}'
-          identity: 'userAssigned'
+          identity: containerAppIdentity.id
+        }
+        {
+          name: 'storage-account-key'
+          keyVaultUrl: '${keyVault.properties.vaultUri}secrets/${storageAccountKeySecretName}'
+          identity: containerAppIdentity.id
         }
       ], includeSmtpSecret ? [
         {
           name: 'pds-smtp-secret'
           keyVaultUrl: '${keyVault.properties.vaultUri}secrets/${smtpSecretName}'
-          identity: 'userAssigned'
+          identity: containerAppIdentity.id
         }
       ] : [])
     }
     template: {
-      revisionSuffix: toLower(format('r{0}', uniqueString(pdsImage)))
       containers: [
-        {
-          name: 'caddy'
-          image: caddyImage
-          resources: {
-            cpu: json(caddyCpu)
-            memory: caddyMemory
-          }
-          volumeMounts: [
-            {
-              volumeName: storageShareStorageName
-              mountPath: '/pds'
-            }
-          ]
-          env: [
-            {
-              name: 'ACME_AGREE'
-              value: 'true'
-            }
-            {
-              name: 'PDS_HOSTNAME'
-              value: pdsHostname
-            }
-          ]
-        }
         {
           name: 'pds'
           image: pdsImage
@@ -341,9 +330,14 @@ resource containerApp 'Microsoft.App/containerApps@2023-05-01' = {
             cpu: json(pdsCpu)
             memory: pdsMemory
           }
+          command: [
+            '/bin/sh'
+            '-c'
+            'while [ ! -f /pds/.restore-complete ]; do echo "waiting for snapshot restore"; sleep 2; done; exec node --enable-source-maps index.js'
+          ]
           volumeMounts: [
             {
-              volumeName: storageShareStorageName
+              volumeName: 'pds-data'
               mountPath: '/pds'
             }
           ]
@@ -373,8 +367,28 @@ resource containerApp 'Microsoft.App/containerApps@2023-05-01' = {
               value: '/pds/blobs/tmp'
             }
             {
-              name: 'PDS_SQLITE_DISABLE_WAL_AUTO_CHECKPOINT'
-              value: 'true'
+              name: 'PDS_BSKY_APP_VIEW_URL'
+              value: '${pdsBskyAppViewUrl}'
+            }
+            {
+              name: 'PDS_BSKY_APP_VIEW_DID'
+              value: '${pdsBskyAppViewDid}'
+            }
+            {
+              name: 'PDS_REPORT_SERVICE_URL'
+              value: '${pdsReportServiceUrl}'
+            }
+            {
+              name: 'PDS_REPORT_SERVICE_DID'
+              value: '${pdsReportServiceDid}'
+            }
+            {
+              name: 'PDS_CRAWLERS'
+              value: '${pdsCrawlers}'
+            }
+            {
+              name: 'PDS_DID_PLC_URL'
+              secretRef: '${pdsDidPlcUrl}'
             }
             {
               name: 'PDS_EMAIL_FROM_ADDRESS'
@@ -399,6 +413,79 @@ resource containerApp 'Microsoft.App/containerApps@2023-05-01' = {
             }
           ] : [])
         }
+        {
+          name: 'snapshot-agent'
+          image: 'mcr.microsoft.com/azure-cli:2.64.0'
+          resources: {
+            cpu: json('0.25')
+            memory: '0.5Gi'
+          }
+          command: [
+            '/bin/sh'
+            '-c'
+            'set -euo pipefail; echo "[snapshot-agent] Detecting package manager"; if command -v apt-get >/dev/null 2>&1; then echo "[snapshot-agent] Installing deps via apt-get"; DEBIAN_FRONTEND=noninteractive apt-get update >/dev/null && DEBIAN_FRONTEND=noninteractive apt-get install -y sqlite3 zstd tar gawk >/dev/null; elif command -v apk >/dev/null 2>&1; then echo "[snapshot-agent] Installing deps via apk"; apk add --no-cache sqlite zstd tar gawk; elif command -v microdnf >/dev/null 2>&1; then echo "[snapshot-agent] Installing deps via microdnf"; microdnf install -y sqlite zstd tar gawk; elif command -v dnf >/dev/null 2>&1; then echo "[snapshot-agent] Installing deps via dnf"; dnf install -y sqlite zstd tar gawk; elif command -v yum >/dev/null 2>&1; then echo "[snapshot-agent] Installing deps via yum"; yum install -y sqlite zstd tar gawk; elif command -v tdnf >/dev/null 2>&1; then echo "[snapshot-agent] Installing deps via tdnf"; tdnf install -y sqlite tar gawk zstd; else echo "ERROR: no supported package manager found" >&2; exit 1; fi; printf "%s" "$RESTORE_SCRIPT_B64" | base64 -d > /scripts/restore.sh; printf "%s" "$BACKUP_LOOP_SCRIPT_B64" | base64 -d > /scripts/backup-loop.sh; chmod +x /scripts/*.sh; /scripts/restore.sh && exec /scripts/backup-loop.sh'
+          ]
+          env: [
+            {
+              name: 'AZURE_STORAGE_ACCOUNT_NAME'
+              value: storageAccount.name
+            }
+            {
+              name: 'AZURE_STORAGE_ACCOUNT_KEY'
+              secretRef: 'storage-account-key'
+            }
+            {
+              name: 'SNAPSHOT_CONTAINER'
+              value: snapshotContainerName
+            }
+            {
+              name: 'SNAPSHOT_PREFIX'
+              value: snapshotPrefix
+            }
+            {
+              name: 'RESTORE_SCRIPT_B64'
+              value: base64(backupRestoreScriptContent)
+            }
+            {
+              name: 'BACKUP_LOOP_SCRIPT_B64'
+              value: base64(backupLoopScriptContent)
+            }
+            {
+              name: 'PDS_ID'
+              value: namePrefix
+            }
+            {
+              name: 'INTERVAL_SECONDS'
+              value: string(backupIntervalSeconds)
+            }
+            {
+              name: 'RETAIN_COUNT'
+              value: string(backupRetentionCount)
+            }
+            {
+              name: 'DATA_DIR'
+              value: '/data'
+            }
+            {
+              name: 'WORK_DIR'
+              value: '/work'
+            }
+            {
+              name: 'SENTINEL_PATH'
+              value: '/data/.restore-complete'
+            }
+          ]
+          volumeMounts: [
+            {
+              volumeName: 'pds-data'
+              mountPath: '/data'
+            }
+            {
+              volumeName: 'backup-scripts'
+              mountPath: '/scripts'
+            }
+          ]
+        }
       ]
       scale: {
         minReplicas: minReplicas
@@ -406,22 +493,55 @@ resource containerApp 'Microsoft.App/containerApps@2023-05-01' = {
       }
       volumes: [
         {
-          name: storageShareStorageName
-          storageType: 'AzureFile'
-          storageName: storageShareStorageName
+          name: 'pds-data'
+          storageType: 'EmptyDir'
+        }
+        {
+          name: 'backup-scripts'
+          storageType: 'EmptyDir'
         }
       ]
     }
   }
-  dependsOn: enableCommunicationServices ? [
-    storageMount
-    emailFromAddressSecret
-    smtpSecretSeed
-    kvPolicyApp
-  ] : [
-    storageMount
-    emailFromAddressSecret
-    kvPolicyApp
+  dependsOn: containerAppDependencies
+}
+
+resource containerAppCustomDomainPlaceholder 'Microsoft.App/containerApps/customDomains@2024-03-01' = if (managedCertificateEnabled) {
+  name: pdsHostname
+  parent: containerApp
+  properties: {
+    bindingType: 'Disabled'
+  }
+  dependsOn: [
+    containerApp
+  ]
+}
+
+resource managedCertificate 'Microsoft.App/managedEnvironments/managedCertificates@2024-03-01' = if (managedCertificateEnabled) {
+  name: managedCertificateName
+  parent: managedEnvironment
+  location: location
+  properties: {
+    subjectName: pdsHostname
+    domainControlValidation: 'TXT'
+  }
+  dependsOn: [
+    containerAppCustomDomainPlaceholder
+    dnsVerificationRecord
+  ]
+}
+
+module enableCustomDomainSni 'containerapp-enable-sni.bicep' = if (managedCertificateEnabled) {
+  name: '${namePrefix}-enable-sni'
+  params: {
+    containerAppName: containerAppName
+    hostname: pdsHostname
+    certificateId: managedCertificateResourceId
+  }
+  dependsOn: [
+    managedCertificate
+    dnsVerificationRecord
+    containerAppCustomDomainPlaceholder
   ]
 }
 
@@ -458,79 +578,7 @@ resource containerAppDiagnostics 'Microsoft.Insights/diagnosticSettings@2021-05-
   }
 }
 
-resource automationAccount 'Microsoft.Automation/automationAccounts@2023-11-01' = {
-  name: automationAccountName
-  location: location
-  identity: {
-    type: 'SystemAssigned'
-  }
-  properties: {
-    sku: {
-      name: 'Basic'
-    }
-    encryption: {
-      keySource: 'Microsoft.Automation'
-    }
-  }
-}
-
-resource backupRunbook 'Microsoft.Automation/automationAccounts/runbooks@2023-11-01' = {
-  name: runbookName
-  parent: automationAccount
-  location: location
-  properties: {
-    runbookType: 'PowerShell'
-    description: 'Creates daily snapshots of the PDS Azure Files share and manages retention'
-    publishContentLink: {
-  uri: backupRunbookContentLink.uri
-  contentHash: backupRunbookContentLink.contentHash
-    }
-  }
-}
-
-resource backupSchedule 'Microsoft.Automation/automationAccounts/schedules@2023-11-01' = {
-  name: scheduleName
-  parent: automationAccount
-  properties: {
-    frequency: 'Day'
-    interval: 1
-    startTime: scheduleStartTime
-    timeZone: 'UTC'
-    description: 'Daily backup schedule for PDS files'
-  }
-}
-
-resource jobSchedule 'Microsoft.Automation/automationAccounts/jobSchedules@2023-11-01' = {
-  name: guid(automationAccount.id, backupRunbook.id, backupSchedule.id)
-  parent: automationAccount
-  properties: {
-    runbook: {
-      name: backupRunbook.name
-    }
-    schedule: {
-      name: backupSchedule.name
-    }
-    parameters: {
-      StorageAccountName: storageAccount.name
-      ShareName: fileShareName
-      RetentionDays: string(backupRetentionDays)
-      ResourceGroupName: resourceGroup().name
-    }
-  }
-}
-
-// Grant Storage Account Contributor role to automation account
-resource automationStorageRoleAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(storageAccount.id, automationAccount.id, 'ba92f5b4-2d11-453d-a403-e96b0029c9fe', 'storage')
-  scope: storageAccount
-  properties: {
-    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'ba92f5b4-2d11-453d-a403-e96b0029c9fe') // Storage Account Contributor
-    principalId: automationAccount.identity.principalId
-    principalType: 'ServicePrincipal'
-  }
-}
-
-// Store storage account key in Key Vault for runbook access
+// Store storage account key in Key Vault for backup agent access
 resource storageKeySecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = {
   name: storageAccountKeySecretName
   parent: keyVault
@@ -539,20 +587,9 @@ resource storageKeySecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = {
   }
 }
 
-// Grant Key Vault Secrets User role to automation account
-resource automationKvRoleAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(keyVault.id, automationAccount.id, '4633458b-17de-408a-b874-0445c86b69e6', 'automation')
-  scope: keyVault
-  properties: {
-    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '4633458b-17de-408a-b874-0445c86b69e6') // Key Vault Secrets User
-    principalId: automationAccount.identity.principalId
-    principalType: 'ServicePrincipal'
-  }
-}
-
 // Grant Key Vault Secrets User role to container app
 resource containerAppKvRoleAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(keyVault.id, containerApp.id, '4633458b-17de-408a-b874-0445c86b69e6', 'containerapp')
+  name: guid(keyVault.id, containerAppIdentity.id, '4633458b-17de-408a-b874-0445c86b69e6')
   scope: keyVault
   properties: {
     roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '4633458b-17de-408a-b874-0445c86b69e6') // Key Vault Secrets User
@@ -626,9 +663,12 @@ resource dnsRecord 'Microsoft.Network/dnsZones/CNAME@2023-07-01-preview' = if (d
   properties: {
     TTL: 300
     CNAMERecord: {
-      cname: containerApp.properties.configuration.ingress.fqdn
+      cname: reference(containerApp.id, '2023-05-01', 'full').properties.configuration.ingress.fqdn
     }
   }
+  dependsOn: [
+    containerApp
+  ]
 }
 
 resource dnsWildcardRecord 'Microsoft.Network/dnsZones/CNAME@2023-07-01-preview' = if (dnsZoneName != '') {
@@ -637,21 +677,42 @@ resource dnsWildcardRecord 'Microsoft.Network/dnsZones/CNAME@2023-07-01-preview'
   properties: {
     TTL: 300
     CNAMERecord: {
-      cname: containerApp.properties.configuration.ingress.fqdn
+      cname: reference(containerApp.id, '2023-05-01', 'full').properties.configuration.ingress.fqdn
     }
   }
+  dependsOn: [
+    containerApp
+  ]
+}
+
+resource dnsVerificationRecord 'Microsoft.Network/dnsZones/TXT@2023-07-01-preview' = if (dnsZoneName != '') {
+  name: 'asuid.${dnsRecordName}'
+  parent: dnsZone
+  properties: {
+    TTL: 300
+    TXTRecords: [
+      {
+        value: [
+          reference(containerApp.id, '2023-05-01', 'full').properties.customDomainVerificationId
+        ]
+      }
+    ]
+  }
+  dependsOn: [
+    containerApp
+  ]
 }
 
 output containerAppName string = containerApp.name
-output containerAppFqdn string = containerApp.properties.configuration.ingress.fqdn
+output containerAppFqdn string = reference(containerApp.id, '2023-05-01', 'full').properties.configuration.ingress.fqdn
 output storageAccountId string = storageAccount.id
-output fileSharePath string = storageFileShare.name
+output snapshotContainerResourceId string = snapshotContainer.id
+output snapshotContainerName string = snapshotContainerName
 output keyVaultUri string = keyVault.properties.vaultUri
-output automationAccountName string = automationAccount.name
-output automationRunbookId string = backupRunbook.id
-output backupScheduleName string = backupSchedule.name
 output communicationServiceEndpoint string = enableCommunicationServices ? communicationService!.properties.hostName : ''
 output emailServiceName string = enableCommunicationServices ? emailService!.name : ''
+output managedCertificateResourceId string = useManagedCertificate ? managedCertificate.id : ingressCertificateResourceId
+output containerAppCustomDomainVerificationId string = reference(containerApp.id, '2023-05-01', 'full').properties.customDomainVerificationId
 output smtpServer string = 'smtp.azurecomm.net'
 output smtpPort int = 587
 output communicationServiceResourceId string = enableCommunicationServices ? communicationService!.id : ''

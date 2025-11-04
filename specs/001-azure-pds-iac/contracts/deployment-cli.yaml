@@ -1,0 +1,116 @@
+openapi: 3.1.0
+info:
+  title: Azure PDS Deployment CLI Contract
+  version: 1.0.0
+  description: REST-like contract representing CLI command surfaces for deploying and validating the PDS infrastructure.
+paths:
+  /deploy:
+    post:
+      summary: Execute resource group scoped deployment.
+      description: Mirrors `az deployment group create` with required parameters.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - resourceGroup
+                - templateFile
+                - parameters
+              properties:
+                resourceGroup:
+                  type: string
+                  description: Target Azure resource group.
+                templateFile:
+                  type: string
+                  description: Path to main Bicep template.
+                parameters:
+                  type: object
+                  additionalProperties: true
+                  description: Deployment parameters matching DeploymentParameters entity.
+      responses:
+        '202':
+          description: Deployment accepted; provisioning in progress.
+        '200':
+          description: Deployment completed successfully.
+        '4XX':
+          description: Validation error in provided parameters.
+        '5XX':
+          description: Azure platform error.
+  /deploy/what-if:
+    post:
+      summary: Preview changes without applying them.
+      description: Equivalent to `az deployment group what-if` for detecting drift.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - resourceGroup
+                - templateFile
+                - parameters
+              properties:
+                resourceGroup:
+                  type: string
+                templateFile:
+                  type: string
+                parameters:
+                  type: object
+      responses:
+        '200':
+          description: Returns JSON diff of planned changes.
+  /secrets:
+    post:
+      summary: Documented manual step for secret creation.
+      description: Captures required secret names and expected value types.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - keyVaultName
+                - secrets
+              properties:
+                keyVaultName:
+                  type: string
+                secrets:
+                  type: array
+                  items:
+                    type: object
+                    required:
+                      - name
+                      - description
+                    properties:
+                      name:
+                        type: string
+                      description:
+                        type: string
+                      owner:
+                        type: string
+                        description: Person or team accountable for maintaining the secret value.
+      responses:
+        '204':
+          description: Documentation step acknowledged.
+  /backup/runbook:
+    get:
+      summary: Retrieve backup runbook schedule.
+      responses:
+        '200':
+          description: Returns frequency, start time, and timezone.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  frequency:
+                    type: string
+                    enum: [Daily]
+                  startTime:
+                    type: string
+                  timeZone:
+                    type: string

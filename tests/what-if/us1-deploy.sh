@@ -21,6 +21,7 @@ PDS_JWT_SECRET_NAME="${PDS_JWT_SECRET_NAME:-PDS-JWT-SECRET}"
 PDS_ADMIN_PASSWORD_SECRET_NAME="${PDS_ADMIN_PASSWORD_SECRET_NAME:-PDS-ADMIN-PASSWORD}"
 PDS_PLC_KEY_SECRET_NAME="${PDS_PLC_KEY_SECRET_NAME:-PDS-PLC-KEY}"
 SMTP_SECRET_NAME="${SMTP_SECRET_NAME:-PDS-SMTP-SECRET}"
+SNAPSHOT_CONTAINER_NAME="${SNAPSHOT_CONTAINER_NAME:-pds-sqlite}"
 
 # Script directory
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -259,8 +260,8 @@ function run_post_deployment_verification() {
         ((verification_errors++))
     fi
     
-    # Verify Storage Account and File Share
-    echo "🔍 Checking Storage Account and File Share..."
+    # Verify Storage Account and snapshot container
+    echo "🔍 Checking Storage Account and snapshot container..."
     local storage_account_name=$(az resource list \
         --resource-group "$RESOURCE_GROUP" \
         --resource-type "Microsoft.Storage/storageAccounts" \
@@ -270,10 +271,10 @@ function run_post_deployment_verification() {
     if [[ -n "$storage_account_name" ]]; then
         echo "✅ Storage Account found: $storage_account_name"
         
-        if az storage share show --name "pds" --account-name "$storage_account_name" >/dev/null 2>&1; then
-            echo "✅ Azure Files share 'pds' exists"
+        if az storage container show --name "$SNAPSHOT_CONTAINER_NAME" --account-name "$storage_account_name" >/dev/null 2>&1; then
+            echo "✅ Snapshot container '$SNAPSHOT_CONTAINER_NAME' exists"
         else
-            echo "❌ Azure Files share 'pds' not found"
+            echo "❌ Snapshot container '$SNAPSHOT_CONTAINER_NAME' not found"
             ((verification_errors++))
         fi
     else
@@ -281,37 +282,18 @@ function run_post_deployment_verification() {
         ((verification_errors++))
     fi
     
-    # Verify Automation Account and Runbook
-    echo "🔍 Checking Automation Account..."
-    local automation_account_name="${NAME_PREFIX}-auto"
-    if az automation account show \
-        --name "$automation_account_name" \
-        --resource-group "$RESOURCE_GROUP" >/dev/null 2>&1; then
-        echo "✅ Automation Account exists"
-        
-        # Check runbook
-        if az automation runbook show \
-            --name "BackupPdsFiles" \
-            --automation-account-name "$automation_account_name" \
-            --resource-group "$RESOURCE_GROUP" >/dev/null 2>&1; then
-            echo "✅ Backup runbook exists"
-        else
-            echo "❌ Backup runbook not found"
-            ((verification_errors++))
-        fi
-        
-        # Check schedule
-        if az automation schedule show \
-            --name "DailyBackupSchedule" \
-            --automation-account-name "$automation_account_name" \
-            --resource-group "$RESOURCE_GROUP" >/dev/null 2>&1; then
-            echo "✅ Backup schedule configured"
-        else
-            echo "❌ Backup schedule not found"
-            ((verification_errors++))
-        fi
+    # Verify backup agent container
+    echo "🔍 Checking backup agent configuration..."
+    local container_names=$(az containerapp show \
+        --name "$container_app_name" \
+        --resource-group "$RESOURCE_GROUP" \
+        --query "properties.template.containers[].name" \
+        --output tsv 2>/dev/null | tr '\r' '\n')
+
+    if echo "$container_names" | grep -q "snapshot-agent"; then
+        echo "✅ Backup agent container configured"
     else
-        echo "❌ Automation Account not found"
+        echo "❌ Backup agent container not found"
         ((verification_errors++))
     fi
     

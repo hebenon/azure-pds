@@ -21,10 +21,9 @@ az resource list --resource-group <RESOURCE_GROUP> --output table
 - [ ] Log Analytics Workspace (`<namePrefix>-law`)
 - [ ] Container Apps Environment (`<namePrefix>-cae`)
 - [ ] Storage Account (`<namePrefix><uniqueString>`)
-- [ ] Azure Files Share (`pds`)
+- [ ] Snapshot Blob Container (`<snapshotContainerName>`)
 - [ ] Key Vault (`<namePrefix>-kv`)
 - [ ] Container App (`<namePrefix>-pds-app`)
-- [ ] Automation Account (`<namePrefix>-auto`)
 - [ ] DNS Zone (if `dnsZoneName` was specified)
 - [ ] DNS CNAME Records (if DNS was configured)
 
@@ -86,57 +85,55 @@ az resource list --resource-group <RESOURCE_GROUP> --output table
    - [ ] `PDS-SMTP-SECRET` (or configured name)
    - [ ] `storage-account-key` (created by template)
 
-## 2. Automation Verification
+## 2. Snapshot Agent Verification
 
-### Backup Runbook Check
-1. **Verify runbook exists and is published:**
+### Blob Storage Checks
+1. **Confirm the snapshot container exists:**
    ```bash
-   az automation runbook show \
+   az storage container show \
+     --account-name <STORAGE_ACCOUNT_NAME> \
+     --name <SNAPSHOT_CONTAINER_NAME>
+   ```
+
+2. **List the most recent archives:**
+   ```bash
+   az storage blob list \
+     --account-name <STORAGE_ACCOUNT_NAME> \
+     --container-name <SNAPSHOT_CONTAINER_NAME> \
+     --prefix <SNAPSHOT_PREFIX>/<NAME_PREFIX>/ \
+     --num-results 3 \
+     --query "[].{name:name, lastModified:properties.lastModified}"
+   ```
+   Expect at least one `snap-YYYYmmdd-HHMMSS.tar.zst` entry once the sidecar has completed a cycle.
+
+### Sidecar Health
+1. **Ensure the `snapshot-agent` container is configured:**
+   ```bash
+   az containerapp show \
      --resource-group <RESOURCE_GROUP> \
-     --automation-account-name <AUTOMATION_ACCOUNT_NAME> \
-     --name BackupPdsFiles \
-     --query "{name:name, state:state}"
+     --name <CONTAINER_APP_NAME> \
+     --query "properties.template.containers[?name=='snapshot-agent']"
    ```
-   Expected state: `"Published"`
+   Expected: JSON object describing the sidecar container.
 
-2. **Check schedule configuration:**
+2. **Tail snapshot-agent logs for recent activity:**
    ```bash
-   az automation schedule show \
+   az containerapp logs show \
      --resource-group <RESOURCE_GROUP> \
-     --automation-account-name <AUTOMATION_ACCOUNT_NAME> \
-     --name DailyBackupSchedule
+     --name <CONTAINER_APP_NAME> \
+     --container snapshot-agent \
+     --tail 20
    ```
-   Verify:
-   - [ ] Frequency matches maintenance window
-   - [ ] Next run time is reasonable
-   - [ ] Schedule is enabled
+   Look for `[backup] Uploading` and `[backup] Enforcing retention` messages without errors.
 
-3. **Verify job schedule linkage:**
-   ```bash
-   az automation job-schedule list \
-     --resource-group <RESOURCE_GROUP> \
-     --automation-account-name <AUTOMATION_ACCOUNT_NAME>
-   ```
-   Expected: Job schedule linking runbook to schedule
+3. **Cold-start restore validation (optional):**
+   - Stop the revision or scale replicas to zero temporarily.
+   - Start the app and tail the snapshot-agent logs.
+   - Confirm `[restore]` log entries appear before the PDS container begins serving traffic.
 
-### Managed Identity Permissions
-1. **Verify automation account has storage permissions:**
-   ```bash
-   az role assignment list \
-     --assignee <AUTOMATION_PRINCIPAL_ID> \
-     --scope <STORAGE_ACCOUNT_ID> \
-     --output table
-   ```
-   Expected role: `Storage Account Contributor`
-
-2. **Verify automation account has Key Vault permissions:**
-   ```bash
-   az role assignment list \
-     --assignee <AUTOMATION_PRINCIPAL_ID> \
-     --scope <KEY_VAULT_ID> \
-     --output table
-   ```
-   Expected role: `Key Vault Secrets User`
+### Key Vault & Secret Checks
+- Confirm the `storage-account-key` secret exists in Key Vault (already covered in Section 1).
+- Ensure the container app managed identity has the Key Vault `Secrets User` role (see outputs/role assignments in the deployment step).
 
 ## 3. Application Functionality Verification
 
@@ -236,45 +233,41 @@ az resource list --resource-group <RESOURCE_GROUP> --output table
 
 ## 7. Backup System Verification
 
-### Manual Backup Test
-1. **Trigger manual backup run (optional):**
+### Snapshot Archive Validation
+1. **List the most recent archive:**
    ```bash
-   az automation runbook start \
-     --resource-group <RESOURCE_GROUP> \
-     --automation-account-name <AUTOMATION_ACCOUNT_NAME> \
-     --name BackupPdsFiles \
-     --parameters StorageAccountName=<STORAGE_ACCOUNT_NAME> ShareName=pds RetentionDays=30 ResourceGroupName=<RESOURCE_GROUP>
-   ```
-
-2. **Monitor job execution:**
-   ```bash
-   az automation job list \
-     --resource-group <RESOURCE_GROUP> \
-     --automation-account-name <AUTOMATION_ACCOUNT_NAME> \
-     --filter "properties/runbook/name eq 'BackupPdsFiles'" \
-     --top 1
-   ```
-
-3. **Verify snapshot creation:**
-   ```bash
-   az storage share list \
+   az storage blob list \
      --account-name <STORAGE_ACCOUNT_NAME> \
-     --include-snapshot \
-     --query "[?name=='pds']"
+     --container-name <SNAPSHOT_CONTAINER_NAME> \
+     --prefix <SNAPSHOT_PREFIX>/<NAME_PREFIX>/ \
+     --num-results 1 \
+     --query "[0].{name:name, lastModified:properties.lastModified}"
    ```
-   Expected: Base share plus snapshot(s)
+   Expected: The blob timestamp is recent (within 1–2 intervals of the snapshot cadence).
+
+2. **Download and inspect (optional):**
+   ```bash
+   az storage blob download \
+     --account-name <STORAGE_ACCOUNT_NAME> \
+     --container-name <SNAPSHOT_CONTAINER_NAME> \
+     --name <BLOB_NAME> \
+     --file snapshot.tar.zst
+   zstd -d snapshot.tar.zst -o snapshot.tar
+   tar -tf snapshot.tar | head
+   ```
+   Confirm SQLite files (`*.sqlite`) and repo directories are present.
 
 ## Troubleshooting Common Issues
 
 ### Container App Not Starting
 - Check container logs: `az containerapp logs show --name <APP_NAME> --resource-group <RG>`
 - Verify all secrets are populated in Key Vault
-- Check managed identity permissions
+- Confirm the snapshot-agent logs show `[restore]` before the PDS container starts
 
-### Backup Jobs Failing
-- Review automation job output: `az automation job get-output --job-id <JOB_ID>`
-- Verify storage account permissions for automation managed identity
-- Check Azure PowerShell module availability in automation account
+### Snapshot Agent Failures
+- Tail snapshot-agent logs for errors related to uploads or permissions
+- Ensure the `storage-account-key` secret exists and matches the storage account key
+- Verify the storage account allows shared key authentication (enabled by default)
 
 ### DNS Resolution Issues
 - Verify DNS zone delegation is correct

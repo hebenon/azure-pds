@@ -52,11 +52,13 @@ az deployment group create \
     pdsPlcRotationKeySecretName=<PLC_KEY_SECRET_NAME> \
     dnsZoneName=<DNS_ZONE> \
     dnsRecordName=<DNS_RECORD> \
-    maintenanceWindow="Sun 02:00" \
-    backupRetentionDays=30
+    snapshotContainerName=pds-sqlite \
+    snapshotPrefix=snapshots \
+    backupIntervalSeconds=15 \
+    backupRetentionCount=200
 ```
 
-> **Backups**: The automation runbook runs **daily** at the UTC time specified by `maintenanceWindow`. The day token is kept for operator clarity only.
+> **Backups**: The snapshot agent defaults to uploading compressed archives every 15 seconds and retains the newest 200 files. Tune the interval and retention parameters to meet your RPO/RTO targets and storage budget.
 
 > **Email Prerequisite**: When `enableCommunicationServices=true`, run `scripts/acs-smtp-setup.sh` after the domain reports `Verified` to create the Microsoft Entra application and populate the SMTP secrets.
 
@@ -64,15 +66,14 @@ az deployment group create \
 
 > **SMTP Secret Name**: The template defaults to the `PDS-SMTP-URL` secret in Key Vault. Only pass `smtpSecretName` if you need to override that name.
 
-> **Runbook Content**: If you are deploying from a feature branch or fork, override `backupRunbookContentUri` (and its matching `backupRunbookContentHash`) so the automation account can download the runbook from your branch.
-
-Record the deployment outputs for Key Vault, Container App, Storage Account, and Automation Account identifiers. These values are referenced throughout the remaining steps.
+Record the deployment outputs for Key Vault, Container App, Storage Account, and snapshot container identifiers. These values are referenced throughout the remaining steps.
 
 **Key deployment outputs to capture:**
 - `keyVaultUri` - Key Vault URL for secret management
 - `containerAppFqdn` - Container App public endpoint
-- `automationAccountName` - Automation Account for backup verification
 - `storageAccountId` - Storage Account resource ID
+- `snapshotContainerResourceId` - Blob container resource ID for archives
+- `snapshotContainerName` - Blob container name (convenience output)
 - `communicationServiceEndpoint` - Azure Communication Services endpoint (if enabled)
 - `smtpServer` - SMTP server hostname (`smtp.azurecomm.net`)
 - `smtpPort` - SMTP server port (`587`)
@@ -129,39 +130,33 @@ Record the deployment outputs for Key Vault, Container App, Storage Account, and
   ```
 - Confirm websocket readiness by exercising the `subscribeRepos` feed.
 
-## 7. Confirm Backup Automation
+## 7. Confirm Snapshot Agent
 
-1. Verify the automation runbook was created successfully:
+1. Verify the snapshot blob container exists:
    ```bash
-   az automation runbook show \
-     --resource-group <RESOURCE_GROUP> \
-     --automation-account-name <AUTO_ACCOUNT_NAME> \
-     --name BackupPdsFiles
-   ```
-
-2. Check the backup schedule configuration:
-   ```bash
-   az automation schedule show \
-     --resource-group <RESOURCE_GROUP> \
-     --automation-account-name <AUTO_ACCOUNT_NAME> \
-     --name DailyBackupSchedule
-   ```
-
-3. Inspect recent and scheduled automation jobs:
-   ```bash
-   az automation job list \
-     --resource-group <RESOURCE_GROUP> \
-     --automation-account-name <AUTO_ACCOUNT_NAME> \
-     --max-items 5
-   ```
-
-4. After the first scheduled run, verify snapshots exist in the Azure Files share:
-   ```bash
-   az storage share list \
+   az storage container show \
      --account-name <STORAGE_ACCOUNT_NAME> \
-     --account-key <STORAGE_KEY> \
-     --include-snapshot
+     --name <SNAPSHOT_CONTAINER_NAME>
    ```
+
+2. Ensure the `snapshot-agent` sidecar is present on the container app:
+   ```bash
+   az containerapp show \
+     --resource-group <RESOURCE_GROUP> \
+     --name <CONTAINER_APP_NAME> \
+     --query "properties.template.containers[].name"
+   ```
+   Confirm the output includes `snapshot-agent`.
+
+3. After the first interval has elapsed, confirm snapshot archives exist:
+   ```bash
+   az storage blob list \
+     --account-name <STORAGE_ACCOUNT_NAME> \
+     --container-name <SNAPSHOT_CONTAINER_NAME> \
+     --prefix <SNAPSHOT_PREFIX>/<NAME_PREFIX>/ \
+     --num-results 5
+   ```
+   Each blob follows the naming convention `snap-YYYYmmdd-HHMMSS.tar.zst`.
 
 ## 8. Configure DNS (Optional)
 
