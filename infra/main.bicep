@@ -170,7 +170,9 @@ var containerAppDependencies = enableCommunicationServices ? [
   storageAccount
 ]
 var backupRestoreScriptContent = loadTextContent('../scripts/pds-backup/restore.sh')
-var backupLoopScriptContent = loadTextContent('../scripts/pds-backup/backup-loop.sh')
+var backupJobScriptContent = loadTextContent('../scripts/pds-backup/backup-job.sh')
+var restoreScriptB64 = base64(backupRestoreScriptContent)
+var backupJobScriptB64 = base64(backupJobScriptContent)
 var computedEmailFromAddress = hasEmailFromOverride ? emailFromAddress : enableCommunicationServices && emailCustomDomain != '' ? 'donotreply@${emailCustomDomain}' : enableCommunicationServices ? 'donotreply@placeholder.azurecomm.net' : 'donotreply@example.com'
 var smtpPlaceholderValue = 'smtps://pending-update@smtp.azurecomm.net:587'
 
@@ -333,12 +335,16 @@ resource containerApp 'Microsoft.App/containerApps@2023-05-01' = {
           command: [
             '/bin/sh'
             '-c'
-            'while [ ! -f /pds/.restore-complete ]; do echo "waiting for snapshot restore"; sleep 2; done; exec node --enable-source-maps index.js'
+            'printf "%s" "$RESTORE_SCRIPT_B64" | base64 -d > /scripts/restore.sh; chmod +x /scripts/restore.sh; /scripts/restore.sh; exec node --enable-source-maps index.js'
           ]
           volumeMounts: [
             {
               volumeName: 'pds-data'
               mountPath: '/pds'
+            }
+            {
+              volumeName: 'scripts'
+              mountPath: '/scripts'
             }
           ]
           env: concat([
@@ -406,26 +412,10 @@ resource containerApp 'Microsoft.App/containerApps@2023-05-01' = {
               name: 'PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX'
               secretRef: 'pds-plc-key'
             }
-          ], includeSmtpSecret ? [
             {
-              name: 'PDS_EMAIL_SMTP_URL'
-              secretRef: 'pds-smtp-secret'
+              name: 'RESTORE_SCRIPT_B64'
+              value: restoreScriptB64
             }
-          ] : [])
-        }
-        {
-          name: 'snapshot-agent'
-          image: 'mcr.microsoft.com/azure-cli:2.64.0'
-          resources: {
-            cpu: json('0.25')
-            memory: '0.5Gi'
-          }
-          command: [
-            '/bin/sh'
-            '-c'
-            'set -euo pipefail; echo "[snapshot-agent] Detecting package manager"; if command -v apt-get >/dev/null 2>&1; then echo "[snapshot-agent] Installing deps via apt-get"; DEBIAN_FRONTEND=noninteractive apt-get update >/dev/null && DEBIAN_FRONTEND=noninteractive apt-get install -y sqlite3 zstd tar gawk >/dev/null; elif command -v apk >/dev/null 2>&1; then echo "[snapshot-agent] Installing deps via apk"; apk add --no-cache sqlite zstd tar gawk; elif command -v microdnf >/dev/null 2>&1; then echo "[snapshot-agent] Installing deps via microdnf"; microdnf install -y sqlite zstd tar gawk; elif command -v dnf >/dev/null 2>&1; then echo "[snapshot-agent] Installing deps via dnf"; dnf install -y sqlite zstd tar gawk; elif command -v yum >/dev/null 2>&1; then echo "[snapshot-agent] Installing deps via yum"; yum install -y sqlite zstd tar gawk; elif command -v tdnf >/dev/null 2>&1; then echo "[snapshot-agent] Installing deps via tdnf"; tdnf install -y sqlite tar gawk zstd; else echo "ERROR: no supported package manager found" >&2; exit 1; fi; printf "%s" "$RESTORE_SCRIPT_B64" | base64 -d > /scripts/restore.sh; printf "%s" "$BACKUP_LOOP_SCRIPT_B64" | base64 -d > /scripts/backup-loop.sh; chmod +x /scripts/*.sh; /scripts/restore.sh && exec /scripts/backup-loop.sh'
-          ]
-          env: [
             {
               name: 'AZURE_STORAGE_ACCOUNT_NAME'
               value: storageAccount.name
@@ -443,48 +433,27 @@ resource containerApp 'Microsoft.App/containerApps@2023-05-01' = {
               value: snapshotPrefix
             }
             {
-              name: 'RESTORE_SCRIPT_B64'
-              value: base64(backupRestoreScriptContent)
-            }
-            {
-              name: 'BACKUP_LOOP_SCRIPT_B64'
-              value: base64(backupLoopScriptContent)
-            }
-            {
               name: 'PDS_ID'
               value: namePrefix
             }
             {
-              name: 'INTERVAL_SECONDS'
-              value: string(backupIntervalSeconds)
-            }
-            {
-              name: 'RETAIN_COUNT'
-              value: string(backupRetentionCount)
-            }
-            {
               name: 'DATA_DIR'
-              value: '/data'
+              value: '/pds'
             }
             {
               name: 'WORK_DIR'
-              value: '/work'
+              value: '/pds/work'
             }
             {
               name: 'SENTINEL_PATH'
-              value: '/data/.restore-complete'
+              value: '/pds/.restore-complete'
             }
-          ]
-          volumeMounts: [
+          ], includeSmtpSecret ? [
             {
-              volumeName: 'pds-data'
-              mountPath: '/data'
+              name: 'PDS_EMAIL_SMTP_URL'
+              secretRef: 'pds-smtp-secret'
             }
-            {
-              volumeName: 'backup-scripts'
-              mountPath: '/scripts'
-            }
-          ]
+          ] : [])
         }
       ]
       scale: {
@@ -497,7 +466,7 @@ resource containerApp 'Microsoft.App/containerApps@2023-05-01' = {
           storageType: 'EmptyDir'
         }
         {
-          name: 'backup-scripts'
+          name: 'scripts'
           storageType: 'EmptyDir'
         }
       ]
@@ -576,6 +545,108 @@ resource containerAppDiagnostics 'Microsoft.Insights/diagnosticSettings@2021-05-
       }
     ]
   }
+}
+
+resource backupJob 'Microsoft.App/containerAppsJobs@2024-03-01' = {
+  name: '${namePrefix}-pds-backup-job'
+  location: location
+  identity: {
+    type: 'UserAssigned'
+    userAssignedIdentities: {
+      '${containerAppIdentity.id}': {}
+    }
+  }
+  properties: {
+    environmentId: managedEnvironment.id
+    workloadProfileName: 'consumption'
+    configuration: {
+      secrets: [
+        {
+          name: 'storage-account-key'
+          keyVaultUrl: '${keyVault.properties.vaultUri}secrets/${storageAccountKeySecretName}'
+          identity: containerAppIdentity.id
+        }
+      ]
+      scheduleTriggerConfig: {
+        cronExpression: '0 */5 * * * *'
+        parallelism: 1
+        replicaCompletionCount: 1
+      }
+    }
+    template: {
+      containers: [
+        {
+          name: 'backup-job'
+          image: 'mcr.microsoft.com/azure-cli:2.64.0'
+          resources: {
+            cpu: json('0.5')
+            memory: '1Gi'
+          }
+          command: [
+            '/bin/sh'
+            '-c'
+            'set -euo pipefail; echo "[backup-job-init] Detecting package manager"; if command -v apt-get >/dev/null 2>&1; then echo "[backup-job-init] Installing deps via apt-get"; DEBIAN_FRONTEND=noninteractive apt-get update >/dev/null && DEBIAN_FRONTEND=noninteractive apt-get install -y sqlite3 zstd tar gawk >/dev/null; elif command -v apk >/dev/null 2>&1; then echo "[backup-job-init] Installing deps via apk"; apk add --no-cache sqlite zstd tar gawk; elif command -v microdnf >/dev/null 2>&1; then echo "[backup-job-init] Installing deps via microdnf"; microdnf install -y sqlite zstd tar gawk; elif command -v dnf >/dev/null 2>&1; then echo "[backup-job-init] Installing deps via dnf"; dnf install -y sqlite zstd tar gawk; elif command -v yum >/dev/null 2>&1; then echo "[backup-job-init] Installing deps via yum"; yum install -y sqlite zstd tar gawk; elif command -v tdnf >/dev/null 2>&1; then echo "[backup-job-init] Installing deps via tdnf"; tdnf install -y sqlite tar gawk zstd; else echo "ERROR: no supported package manager found" >&2; exit 1; fi; printf "%s" "$BACKUP_JOB_SCRIPT_B64" | base64 -d > /scripts/backup-job.sh; chmod +x /scripts/backup-job.sh; exec /scripts/backup-job.sh'
+          ]
+          env: [
+            {
+              name: 'AZURE_STORAGE_ACCOUNT_NAME'
+              value: storageAccount.name
+            }
+            {
+              name: 'AZURE_STORAGE_ACCOUNT_KEY'
+              secretRef: 'storage-account-key'
+            }
+            {
+              name: 'SNAPSHOT_CONTAINER'
+              value: snapshotContainerName
+            }
+            {
+              name: 'SNAPSHOT_PREFIX'
+              value: snapshotPrefix
+            }
+            {
+              name: 'BACKUP_JOB_SCRIPT_B64'
+              value: backupJobScriptB64
+            }
+            {
+              name: 'PDS_ID'
+              value: namePrefix
+            }
+            {
+              name: 'RETAIN_COUNT'
+              value: string(backupRetentionCount)
+            }
+            {
+              name: 'DATA_DIR'
+              value: '/data'
+            }
+            {
+              name: 'WORK_DIR'
+              value: '/work'
+            }
+          ]
+          volumeMounts: [
+            {
+              volumeName: 'pds-data'
+              mountPath: '/data'
+            }
+          ]
+        }
+      ]
+      volumes: [
+        {
+          name: 'pds-data'
+          storageType: 'EmptyDir'
+        }
+      ]
+    }
+  }
+  dependsOn: [
+    containerAppIdentity
+    managedEnvironment
+    kvPolicyApp
+    storageKeySecret
+  ]
 }
 
 // Store storage account key in Key Vault for backup agent access
