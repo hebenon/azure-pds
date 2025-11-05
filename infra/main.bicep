@@ -101,10 +101,6 @@ param snapshotContainerName string = 'pds-sqlite'
 @minLength(1)
 param snapshotPrefix string = 'snapshots'
 
-@description('Interval in seconds between snapshot uploads.')
-@minValue(5)
-param backupIntervalSeconds int = 15
-
 @description('Number of snapshot archives to retain in object storage.')
 @minValue(10)
 param backupRetentionCount int = 200
@@ -380,23 +376,23 @@ resource containerApp 'Microsoft.App/containerApps@2023-05-01' = {
             }
             {
               name: 'PDS_BSKY_APP_VIEW_URL'
-              value: '${pdsBskyAppViewUrl}'
+              value: pdsBskyAppViewUrl
             }
             {
               name: 'PDS_BSKY_APP_VIEW_DID'
-              value: '${pdsBskyAppViewDid}'
+              value: pdsBskyAppViewDid
             }
             {
               name: 'PDS_REPORT_SERVICE_URL'
-              value: '${pdsReportServiceUrl}'
+              value: pdsReportServiceUrl
             }
             {
               name: 'PDS_REPORT_SERVICE_DID'
-              value: '${pdsReportServiceDid}'
+              value: pdsReportServiceDid
             }
             {
               name: 'PDS_CRAWLERS'
-              value: '${pdsCrawlers}'
+              value: pdsCrawlers
             }
             {
               name: 'PDS_DID_PLC_URL'
@@ -487,9 +483,6 @@ resource containerAppCustomDomainPlaceholder 'Microsoft.App/containerApps/custom
   properties: {
     bindingType: 'Disabled'
   }
-  dependsOn: [
-    containerApp
-  ]
 }
 
 resource managedCertificate 'Microsoft.App/managedEnvironments/managedCertificates@2024-03-01' = if (managedCertificateEnabled) {
@@ -565,6 +558,8 @@ resource backupJob 'Microsoft.App/jobs@2024-03-01' = {
   properties: {
     environmentId: managedEnvironment.id
     configuration: {
+      triggerType: 'Schedule'
+      replicaTimeout: 600
       secrets: [
         {
           name: 'storage-account-key'
@@ -646,12 +641,6 @@ resource backupJob 'Microsoft.App/jobs@2024-03-01' = {
       ]
     }
   }
-  dependsOn: [
-    containerAppIdentity
-    managedEnvironment
-    kvPolicyApp
-    storageKeySecret
-  ]
 }
 
 // Store storage account key in Key Vault for backup agent access
@@ -739,12 +728,9 @@ resource dnsRecord 'Microsoft.Network/dnsZones/CNAME@2023-07-01-preview' = if (d
   properties: {
     TTL: 300
     CNAMERecord: {
-      cname: reference(containerApp.id, '2023-05-01', 'full').properties.configuration.ingress.fqdn
+      cname: containerApp.properties.configuration.ingress.fqdn
     }
   }
-  dependsOn: [
-    containerApp
-  ]
 }
 
 resource dnsWildcardRecord 'Microsoft.Network/dnsZones/CNAME@2023-07-01-preview' = if (dnsZoneName != '') {
@@ -753,12 +739,9 @@ resource dnsWildcardRecord 'Microsoft.Network/dnsZones/CNAME@2023-07-01-preview'
   properties: {
     TTL: 300
     CNAMERecord: {
-      cname: reference(containerApp.id, '2023-05-01', 'full').properties.configuration.ingress.fqdn
+      cname: containerApp.properties.configuration.ingress.fqdn
     }
   }
-  dependsOn: [
-    containerApp
-  ]
 }
 
 resource dnsVerificationRecord 'Microsoft.Network/dnsZones/TXT@2023-07-01-preview' = if (dnsZoneName != '') {
@@ -769,18 +752,15 @@ resource dnsVerificationRecord 'Microsoft.Network/dnsZones/TXT@2023-07-01-previe
     TXTRecords: [
       {
         value: [
-          reference(containerApp.id, '2023-05-01', 'full').properties.customDomainVerificationId
+          containerApp.properties.customDomainVerificationId
         ]
       }
     ]
   }
-  dependsOn: [
-    containerApp
-  ]
 }
 
 output containerAppName string = containerApp.name
-output containerAppFqdn string = reference(containerApp.id, '2023-05-01', 'full').properties.configuration.ingress.fqdn
+output containerAppFqdn string = containerApp.properties.configuration.ingress.fqdn
 output storageAccountId string = storageAccount.id
 output snapshotContainerResourceId string = snapshotContainer.id
 output snapshotContainerName string = snapshotContainerName
@@ -788,7 +768,7 @@ output keyVaultUri string = keyVault.properties.vaultUri
 output communicationServiceEndpoint string = enableCommunicationServices ? communicationService!.properties.hostName : ''
 output emailServiceName string = enableCommunicationServices ? emailService!.name : ''
 output managedCertificateResourceId string = useManagedCertificate ? managedCertificate.id : ingressCertificateResourceId
-output containerAppCustomDomainVerificationId string = reference(containerApp.id, '2023-05-01', 'full').properties.customDomainVerificationId
+output containerAppCustomDomainVerificationId string = containerApp.properties.customDomainVerificationId
 output smtpServer string = 'smtp.azurecomm.net'
 output smtpPort int = 587
 output communicationServiceResourceId string = enableCommunicationServices ? communicationService!.id : ''
