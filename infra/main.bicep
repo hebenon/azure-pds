@@ -148,7 +148,13 @@ var ingressCustomDomains = hasIngressCertificate ? [
     certificateId: ingressCertificateResourceId
     bindingType: 'SniEnabled'
   }
-] : []
+] : (managedCertificateEnabled ? [
+  {
+    name: pdsHostname
+    certificateId: managedCertificateResourceId
+    bindingType: 'SniEnabled'
+  }
+] : [])
 
 var storageAccountKeySecretName = 'storage-account-key'
 var communicationServiceName = '${namePrefix}-acs'
@@ -394,7 +400,7 @@ resource containerApp 'Microsoft.App/containerApps@2023-05-01' = {
             }
             {
               name: 'PDS_DID_PLC_URL'
-              secretRef: '${pdsDidPlcUrl}'
+              value: '${pdsDidPlcUrl}'
             }
             {
               name: 'PDS_EMAIL_FROM_ADDRESS'
@@ -547,7 +553,7 @@ resource containerAppDiagnostics 'Microsoft.Insights/diagnosticSettings@2021-05-
   }
 }
 
-resource backupJob 'Microsoft.App/containerAppsJobs@2024-03-01' = {
+resource backupJob 'Microsoft.App/jobs@2024-03-01' = {
   name: '${namePrefix}-pds-backup-job'
   location: location
   identity: {
