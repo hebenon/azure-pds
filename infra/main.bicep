@@ -564,7 +564,6 @@ resource backupJob 'Microsoft.App/jobs@2024-03-01' = {
   }
   properties: {
     environmentId: managedEnvironment.id
-    workloadProfileName: 'consumption'
     configuration: {
       secrets: [
         {
