@@ -135,7 +135,7 @@ var managedEnvName = '${namePrefix}-cae'
 var hasIngressCertificate = length(ingressCertificateName) > 0
 var useManagedCertificate = !hasIngressCertificate && enableManagedCertificate
 var managedCertificateEnabled = useManagedCertificate && dnsZoneName != ''
-var managedCertificateName = '${namePrefix}-pds-managed-cert'
+var managedCertificateName = '${namePrefix}-managed-cert'
 var ingressCertificateResourceId = hasIngressCertificate ? resourceId('Microsoft.App/managedEnvironments/certificates', managedEnvName, ingressCertificateName) : ''
 var managedCertificateResourceId = managedCertificateEnabled ? resourceId('Microsoft.App/managedEnvironments/managedCertificates', managedEnvName, managedCertificateName) : ''
 var ingressCustomDomains = hasIngressCertificate ? [
