@@ -568,7 +568,7 @@ resource backupJob 'Microsoft.App/jobs@2024-03-01' = {
         }
       ]
       scheduleTriggerConfig: {
-        cronExpression: '0 */5 * * * *'
+        cronExpression: '*/5 * * * *'
         parallelism: 1
         replicaCompletionCount: 1
       }
