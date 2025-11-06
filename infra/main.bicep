@@ -471,14 +471,6 @@ resource containerApp 'Microsoft.App/containerApps@2023-05-01' = {
   dependsOn: containerAppDependencies
 }
 
-resource containerAppCustomDomainPlaceholder 'Microsoft.App/containerApps/customDomains@2024-03-01' = if (managedCertificateEnabled) {
-  name: pdsHostname
-  parent: containerApp
-  properties: {
-    bindingType: 'Disabled'
-  }
-}
-
 resource managedCertificate 'Microsoft.App/managedEnvironments/managedCertificates@2024-03-01' = if (managedCertificateEnabled) {
   name: managedCertificateName
   parent: managedEnvironment
@@ -488,7 +480,6 @@ resource managedCertificate 'Microsoft.App/managedEnvironments/managedCertificat
     domainControlValidation: 'TXT'
   }
   dependsOn: [
-    containerAppCustomDomainPlaceholder
     dnsVerificationRecord
   ]
 }
@@ -503,7 +494,6 @@ module enableCustomDomainSni 'containerapp-enable-sni.bicep' = if (managedCertif
   dependsOn: [
     managedCertificate
     dnsVerificationRecord
-    containerAppCustomDomainPlaceholder
   ]
 }
 
