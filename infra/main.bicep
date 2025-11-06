@@ -147,7 +147,8 @@ var ingressCustomDomains = hasIngressCertificate ? [
 ] : (managedCertificateEnabled ? [
   {
     name: pdsHostname
-    bindingType: 'Disabled'
+    certificateId: managedCertificateResourceId
+    bindingType: 'SniEnabled'
   }
 ] : [])
 
@@ -473,7 +474,7 @@ resource containerApp 'Microsoft.App/containerApps@2023-05-01' = {
       ]
     }
   }
-  dependsOn: containerAppDependencies
+  dependsOn: concat(containerAppDependencies, managedCertificateEnabled ? [managedCertificate] : [])
 }
 
 resource managedCertificate 'Microsoft.App/managedEnvironments/managedCertificates@2024-03-01' = if (managedCertificateEnabled) {
@@ -485,19 +486,6 @@ resource managedCertificate 'Microsoft.App/managedEnvironments/managedCertificat
     domainControlValidation: 'TXT'
   }
   dependsOn: [
-    dnsVerificationRecord
-  ]
-}
-
-module enableCustomDomainSni 'containerapp-enable-sni.bicep' = if (managedCertificateEnabled) {
-  name: '${namePrefix}-enable-sni'
-  params: {
-    containerAppName: containerAppName
-    hostname: pdsHostname
-    certificateId: managedCertificateResourceId
-  }
-  dependsOn: [
-    managedCertificate
     dnsVerificationRecord
   ]
 }
