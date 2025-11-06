@@ -144,7 +144,12 @@ var ingressCustomDomains = hasIngressCertificate ? [
     certificateId: ingressCertificateResourceId
     bindingType: 'SniEnabled'
   }
-] : []
+] : (managedCertificateEnabled ? [
+  {
+    name: pdsHostname
+    bindingType: 'Disabled'
+  }
+] : [])
 
 var storageAccountKeySecretName = 'storage-account-key'
 var communicationServiceName = '${namePrefix}-acs'
