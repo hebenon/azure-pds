@@ -147,8 +147,7 @@ var ingressCustomDomains = hasIngressCertificate ? [
 ] : (managedCertificateEnabled ? [
   {
     name: pdsHostname
-    certificateId: managedCertificateResourceId
-    bindingType: 'SniEnabled'
+    bindingType: 'Disabled'
   }
 ] : [])
 
@@ -474,7 +473,7 @@ resource containerApp 'Microsoft.App/containerApps@2023-05-01' = {
       ]
     }
   }
-  dependsOn: concat(containerAppDependencies, managedCertificateEnabled ? [managedCertificate] : [])
+  dependsOn: containerAppDependencies
 }
 
 resource managedCertificate 'Microsoft.App/managedEnvironments/managedCertificates@2024-03-01' = if (managedCertificateEnabled) {
@@ -486,6 +485,19 @@ resource managedCertificate 'Microsoft.App/managedEnvironments/managedCertificat
     domainControlValidation: 'TXT'
   }
   dependsOn: [
+    dnsVerificationRecord
+  ]
+}
+
+module enableCustomDomainSni 'containerapp-enable-sni.bicep' = if (managedCertificateEnabled) {
+  name: '${namePrefix}-enable-sni'
+  params: {
+    containerAppName: containerAppName
+    hostname: pdsHostname
+    certificateId: managedCertificateResourceId
+  }
+  dependsOn: [
+    managedCertificate
     dnsVerificationRecord
   ]
 }
@@ -705,7 +717,7 @@ resource dnsRecord 'Microsoft.Network/dnsZones/CNAME@2023-07-01-preview' = if (d
   properties: {
     TTL: 300
     CNAMERecord: {
-      cname: containerApp.properties.configuration.ingress.fqdn
+      cname: reference(containerApp.id, '2023-05-01', 'full').properties.configuration.ingress.fqdn
     }
   }
 }
@@ -729,7 +741,7 @@ resource dnsVerificationRecord 'Microsoft.Network/dnsZones/TXT@2023-07-01-previe
     TXTRecords: [
       {
         value: [
-          containerApp.properties.customDomainVerificationId
+          reference(containerApp.id, '2023-05-01', 'full').properties.customDomainVerificationId
         ]
       }
     ]
