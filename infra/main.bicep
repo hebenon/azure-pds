@@ -482,7 +482,7 @@ resource managedCertificate 'Microsoft.App/managedEnvironments/managedCertificat
   location: location
   properties: {
     subjectName: pdsHostname
-    domainControlValidation: 'TXT'
+    domainControlValidation: 'HTTP'
   }
   dependsOn: [
     dnsVerificationRecord
