@@ -489,52 +489,25 @@ resource managedCertificate 'Microsoft.App/managedEnvironments/managedCertificat
   ]
 }
 
-// Automated SNI binding using deployment script
-resource bindCertificate 'Microsoft.Resources/deploymentScripts@2020-10-01' = if (managedCertificateEnabled) {
-  name: '${namePrefix}-bind-cert'
+// Update containerApp to add SNI binding after certificate is validated
+resource containerAppUpdate 'Microsoft.App/containerApps@2023-05-01' = if (managedCertificateEnabled) {
+  name: containerAppName
   location: location
-  identity: {
-    type: 'UserAssigned'
-    userAssignedIdentities: {
-      '${containerAppIdentity.id}': {}
-    }
-  }
-  kind: 'AzureCLI'
   properties: {
-    azCliVersion: '2.64.0'
-    scriptContent: '''
-      echo "Binding certificate to container app..."
-      az containerapp ingress custom-domain bind \
-        --resource-group ${RESOURCE_GROUP} \
-        --name ${CONTAINER_APP_NAME} \
-        --domain ${HOSTNAME} \
-        --certificate ${CERTIFICATE_NAME}
-      echo "Certificate binding complete"
-    '''
-    environmentVariables: [
-      {
-        name: 'RESOURCE_GROUP'
-        value: resourceGroup().name
+    configuration: {
+      ingress: {
+        customDomains: [
+          {
+            name: pdsHostname
+            certificateId: managedCertificate.id
+            bindingType: 'SniEnabled'
+          }
+        ]
       }
-      {
-        name: 'CONTAINER_APP_NAME'
-        value: containerAppName
-      }
-      {
-        name: 'HOSTNAME'
-        value: pdsHostname
-      }
-      {
-        name: 'CERTIFICATE_NAME'
-        value: managedCertificateName
-      }
-    ]
-    cleanupPreference: 'OnSuccess'
-    retentionInterval: 'PT1H'
+    }
   }
   dependsOn: [
     managedCertificate
-    containerApp
   ]
 }
 
