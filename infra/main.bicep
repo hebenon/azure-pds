@@ -144,7 +144,12 @@ var ingressCustomDomains = hasIngressCertificate ? [
     certificateId: ingressCertificateResourceId
     bindingType: 'SniEnabled'
   }
-] : []
+] : (managedCertificateEnabled ? [
+  {
+    name: pdsHostname
+    bindingType: 'Disabled'
+  }
+] : [])
 
 var storageAccountKeySecretName = 'storage-account-key'
 var communicationServiceName = '${namePrefix}-acs'
@@ -484,28 +489,9 @@ resource managedCertificate 'Microsoft.App/managedEnvironments/managedCertificat
   ]
 }
 
-// Update containerApp to add SNI binding after certificate is created
-resource containerAppUpdate 'Microsoft.App/containerApps@2023-05-01' = if (managedCertificateEnabled) {
-  name: containerAppName
-  location: location
-  properties: {
-    configuration: {
-      ingress: {
-        customDomains: [
-          {
-            name: pdsHostname
-            certificateId: managedCertificate.id
-            bindingType: 'SniEnabled'
-          }
-        ]
-      }
-    }
-  }
-  dependsOn: [
-    managedCertificate
-    containerApp
-  ]
-}
+// Note: Custom domain SNI binding must be configured manually after deployment
+// via: az containerapp ingress custom-domain bind --resource-group mensmachina 
+//      --name pds-pds-app --domain pds.mensmachina.com --certificate pds-managed-cert
 
 resource kvPolicyApp 'Microsoft.KeyVault/vaults/accessPolicies@2023-07-01' = {
   name: 'add'
