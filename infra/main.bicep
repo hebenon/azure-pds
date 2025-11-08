@@ -484,16 +484,26 @@ resource managedCertificate 'Microsoft.App/managedEnvironments/managedCertificat
   ]
 }
 
-module enableCustomDomainSni 'containerapp-enable-sni.bicep' = if (managedCertificateEnabled) {
-  name: '${namePrefix}-enable-sni'
-  params: {
-    containerAppName: containerAppName
-    hostname: pdsHostname
-    certificateId: managedCertificateResourceId
+// Update containerApp to add SNI binding after certificate is created
+resource containerAppUpdate 'Microsoft.App/containerApps@2023-05-01' = if (managedCertificateEnabled) {
+  name: containerAppName
+  location: location
+  properties: {
+    configuration: {
+      ingress: {
+        customDomains: [
+          {
+            name: pdsHostname
+            certificateId: managedCertificate.id
+            bindingType: 'SniEnabled'
+          }
+        ]
+      }
+    }
   }
   dependsOn: [
     managedCertificate
-    dnsVerificationRecord
+    containerApp
   ]
 }
 
