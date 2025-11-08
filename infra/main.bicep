@@ -489,9 +489,54 @@ resource managedCertificate 'Microsoft.App/managedEnvironments/managedCertificat
   ]
 }
 
-// Note: Custom domain SNI binding must be configured manually after deployment
-// via: az containerapp ingress custom-domain bind --resource-group mensmachina 
-//      --name pds-pds-app --domain pds.mensmachina.com --certificate pds-managed-cert
+// Automated SNI binding using deployment script
+resource bindCertificate 'Microsoft.Resources/deploymentScripts@2020-10-01' = if (managedCertificateEnabled) {
+  name: '${namePrefix}-bind-cert'
+  location: location
+  identity: {
+    type: 'UserAssigned'
+    userAssignedIdentities: {
+      '${containerAppIdentity.id}': {}
+    }
+  }
+  kind: 'AzureCLI'
+  properties: {
+    azCliVersion: '2.64.0'
+    scriptContent: '''
+      echo "Binding certificate to container app..."
+      az containerapp ingress custom-domain bind \
+        --resource-group ${RESOURCE_GROUP} \
+        --name ${CONTAINER_APP_NAME} \
+        --domain ${HOSTNAME} \
+        --certificate ${CERTIFICATE_NAME}
+      echo "Certificate binding complete"
+    '''
+    environmentVariables: [
+      {
+        name: 'RESOURCE_GROUP'
+        value: resourceGroup().name
+      }
+      {
+        name: 'CONTAINER_APP_NAME'
+        value: containerAppName
+      }
+      {
+        name: 'HOSTNAME'
+        value: pdsHostname
+      }
+      {
+        name: 'CERTIFICATE_NAME'
+        value: managedCertificateName
+      }
+    ]
+    cleanupPreference: 'OnSuccess'
+    retentionInterval: 'PT1H'
+  }
+  dependsOn: [
+    managedCertificate
+    containerApp
+  ]
+}
 
 resource kvPolicyApp 'Microsoft.KeyVault/vaults/accessPolicies@2023-07-01' = {
   name: 'add'
