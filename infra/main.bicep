@@ -16,11 +16,11 @@ param pdsHostname string
 @maxLength(128)
 param pdsImageTag string
 
-@description('Optional name of a Container Apps certificate resource (within the managed environment) to bind to the ingress. Leave empty to skip automatic binding.')
-param ingressCertificateName string = ''
+@description('Resource ID of an existing Container Apps certificate (managed certificate or uploaded cert) to bind to the ingress. Leave empty to skip custom domain binding.')
+param certificateResourceId string = ''
 
-@description('Whether to let Azure Container Apps request and renew a managed certificate when no existing certificate name is provided.')
-param enableManagedCertificate bool = true
+@description('Whether to enable custom domain binding with the provided certificate.')
+param enableCustomDomain bool = false
 
 @description('CPU request for the PDS container in cores.')
 param pdsCpu string = '0.5'
@@ -132,24 +132,14 @@ var containerAppIdentityName = '${namePrefix}-pds-id'
 var keyVaultName = '${namePrefix}-${uniqueString(resourceGroup().id)}-kv'
 var logAnalyticsName = '${namePrefix}-law'
 var managedEnvName = '${namePrefix}-cae'
-var hasIngressCertificate = length(ingressCertificateName) > 0
-var useManagedCertificate = !hasIngressCertificate && enableManagedCertificate
-var managedCertificateEnabled = useManagedCertificate && dnsZoneName != ''
-var managedCertificateName = '${namePrefix}-managed-cert'
-var ingressCertificateResourceId = hasIngressCertificate ? resourceId('Microsoft.App/managedEnvironments/certificates', managedEnvName, ingressCertificateName) : ''
-var managedCertificateResourceId = managedCertificateEnabled ? resourceId('Microsoft.App/managedEnvironments/managedCertificates', managedEnvName, managedCertificateName) : ''
-var ingressCustomDomains = hasIngressCertificate ? [
+var hasCustomDomainBinding = enableCustomDomain && length(certificateResourceId) > 0
+var ingressCustomDomains = hasCustomDomainBinding ? [
   {
     name: pdsHostname
-    certificateId: ingressCertificateResourceId
+    certificateId: certificateResourceId
     bindingType: 'SniEnabled'
   }
-] : (managedCertificateEnabled ? [
-  {
-    name: pdsHostname
-    bindingType: 'Disabled'
-  }
-] : [])
+] : []
 
 var storageAccountKeySecretName = 'storage-account-key'
 var communicationServiceName = '${namePrefix}-acs'
@@ -395,7 +385,7 @@ resource containerApp 'Microsoft.App/containerApps@2023-05-01' = {
             }
             {
               name: 'PDS_DID_PLC_URL'
-              value: '${pdsDidPlcUrl}'
+              value: pdsDidPlcUrl
             }
             {
               name: 'PDS_EMAIL_FROM_ADDRESS'
@@ -476,40 +466,8 @@ resource containerApp 'Microsoft.App/containerApps@2023-05-01' = {
   dependsOn: containerAppDependencies
 }
 
-resource managedCertificate 'Microsoft.App/managedEnvironments/managedCertificates@2024-03-01' = if (managedCertificateEnabled) {
-  name: managedCertificateName
-  parent: managedEnvironment
-  location: location
-  properties: {
-    subjectName: pdsHostname
-    domainControlValidation: 'HTTP'
-  }
-  dependsOn: [
-    dnsVerificationRecord
-  ]
-}
-
-// Update containerApp to add SNI binding after certificate is validated
-resource containerAppUpdate 'Microsoft.App/containerApps@2023-05-01' = if (managedCertificateEnabled) {
-  name: containerAppName
-  location: location
-  properties: {
-    configuration: {
-      ingress: {
-        customDomains: [
-          {
-            name: pdsHostname
-            certificateId: managedCertificate.id
-            bindingType: 'SniEnabled'
-          }
-        ]
-      }
-    }
-  }
-  dependsOn: [
-    managedCertificate
-  ]
-}
+// Custom domain binding is handled via the certificateResourceId parameter
+// No certificate creation is performed in this template
 
 resource kvPolicyApp 'Microsoft.KeyVault/vaults/accessPolicies@2023-07-01' = {
   name: 'add'
@@ -726,7 +684,7 @@ resource dnsRecord 'Microsoft.Network/dnsZones/CNAME@2023-07-01-preview' = if (d
   properties: {
     TTL: 300
     CNAMERecord: {
-      cname: reference(containerApp.id, '2023-05-01', 'full').properties.configuration.ingress.fqdn
+      cname: containerApp.properties.configuration.ingress.fqdn
     }
   }
 }
@@ -765,7 +723,7 @@ output snapshotContainerName string = snapshotContainerName
 output keyVaultUri string = keyVault.properties.vaultUri
 output communicationServiceEndpoint string = enableCommunicationServices ? communicationService!.properties.hostName : ''
 output emailServiceName string = enableCommunicationServices ? emailService!.name : ''
-output managedCertificateResourceId string = useManagedCertificate ? managedCertificate.id : ingressCertificateResourceId
+output certificateResourceId string = certificateResourceId
 output containerAppCustomDomainVerificationId string = containerApp.properties.customDomainVerificationId
 output smtpServer string = 'smtp.azurecomm.net'
 output smtpPort int = 587

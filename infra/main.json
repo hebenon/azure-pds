@@ -5,7 +5,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.38.33.27573",
-      "templateHash": "9434068036200684310"
+      "templateHash": "598916211728286297"
     }
   },
   "parameters": {
@@ -40,18 +40,18 @@
         "description": "Container image tag for ghcr.io/bluesky-social/pds (e.g. 0.4)."
       }
     },
-    "ingressCertificateName": {
+    "certificateResourceId": {
       "type": "string",
       "defaultValue": "",
       "metadata": {
-        "description": "Optional name of a Container Apps certificate resource (within the managed environment) to bind to the ingress. Leave empty to skip automatic binding."
+        "description": "Resource ID of an existing Container Apps certificate (managed certificate or uploaded cert) to bind to the ingress. Leave empty to skip custom domain binding."
       }
     },
-    "enableManagedCertificate": {
+    "enableCustomDomain": {
       "type": "bool",
-      "defaultValue": true,
+      "defaultValue": false,
       "metadata": {
-        "description": "Whether to let Azure Container Apps request and renew a managed certificate when no existing certificate name is provided."
+        "description": "Whether to enable custom domain binding with the provided certificate."
       }
     },
     "pdsCpu": {
@@ -205,20 +205,54 @@
         "description": "Prefix applied to snapshot blob paths."
       }
     },
-    "backupIntervalSeconds": {
-      "type": "int",
-      "defaultValue": 15,
-      "minValue": 5,
-      "metadata": {
-        "description": "Interval in seconds between snapshot uploads."
-      }
-    },
     "backupRetentionCount": {
       "type": "int",
       "defaultValue": 200,
       "minValue": 10,
       "metadata": {
         "description": "Number of snapshot archives to retain in object storage."
+      }
+    },
+    "pdsDidPlcUrl": {
+      "type": "string",
+      "defaultValue": "https://plc.directory",
+      "metadata": {
+        "description": "URL for the PLC directory service."
+      }
+    },
+    "pdsBskyAppViewUrl": {
+      "type": "string",
+      "defaultValue": "https://api.bsky.app",
+      "metadata": {
+        "description": "URL for the Bluesky API service."
+      }
+    },
+    "pdsBskyAppViewDid": {
+      "type": "string",
+      "defaultValue": "did:web:api.bsky.app",
+      "metadata": {
+        "description": "DID for the Bluesky API service."
+      }
+    },
+    "pdsReportServiceUrl": {
+      "type": "string",
+      "defaultValue": "https://mod.bsky.app",
+      "metadata": {
+        "description": "URL for the Bluesky report service."
+      }
+    },
+    "pdsReportServiceDid": {
+      "type": "string",
+      "defaultValue": "did:plc:ar7c4by46qjdydhdevvrndac",
+      "metadata": {
+        "description": "DID for the Bluesky report service."
+      }
+    },
+    "pdsCrawlers": {
+      "type": "string",
+      "defaultValue": "https://bsky.network",
+      "metadata": {
+        "description": "Crawlers to whitelist for indexing (comma-separated URLs)."
       }
     }
   },
@@ -232,20 +266,17 @@
     "keyVaultName": "[format('{0}-{1}-kv', parameters('namePrefix'), uniqueString(resourceGroup().id))]",
     "logAnalyticsName": "[format('{0}-law', parameters('namePrefix'))]",
     "managedEnvName": "[format('{0}-cae', parameters('namePrefix'))]",
-    "hasIngressCertificate": "[greater(length(parameters('ingressCertificateName')), 0)]",
-    "useManagedCertificate": "[and(not(variables('hasIngressCertificate')), parameters('enableManagedCertificate'))]",
-    "managedCertificateEnabled": "[and(variables('useManagedCertificate'), not(equals(parameters('dnsZoneName'), '')))]",
-    "managedCertificateName": "[format('{0}-pds-managed-cert', parameters('namePrefix'))]",
-    "ingressCertificateResourceId": "[if(variables('hasIngressCertificate'), resourceId('Microsoft.App/managedEnvironments/certificates', variables('managedEnvName'), parameters('ingressCertificateName')), '')]",
-    "managedCertificateResourceId": "[if(variables('managedCertificateEnabled'), resourceId('Microsoft.App/managedEnvironments/managedCertificates', variables('managedEnvName'), variables('managedCertificateName')), '')]",
-    "ingressCustomDomains": "[if(variables('hasIngressCertificate'), createArray(createObject('name', parameters('pdsHostname'), 'certificateId', variables('ingressCertificateResourceId'), 'bindingType', 'SniEnabled')), createArray())]",
+    "hasCustomDomainBinding": "[and(parameters('enableCustomDomain'), greater(length(parameters('certificateResourceId')), 0))]",
+    "ingressCustomDomains": "[if(variables('hasCustomDomainBinding'), createArray(createObject('name', parameters('pdsHostname'), 'certificateId', parameters('certificateResourceId'), 'bindingType', 'SniEnabled')), createArray())]",
     "storageAccountKeySecretName": "storage-account-key",
     "communicationServiceName": "[format('{0}-acs', parameters('namePrefix'))]",
     "emailServiceName": "[format('{0}-email', parameters('namePrefix'))]",
     "hasEmailFromOverride": "[greater(length(parameters('emailFromAddress')), 0)]",
     "includeSmtpSecret": "[greater(length(parameters('smtpSecretName')), 0)]",
     "backupRestoreScriptContent": "#!/usr/bin/env sh\nset -euo pipefail\n\nDATA_DIR=${DATA_DIR:-/data}\nWORK_DIR=${WORK_DIR:-/work}\nSNAPSHOT_CONTAINER=${SNAPSHOT_CONTAINER:-pds-sqlite}\nSNAPSHOT_PREFIX=${SNAPSHOT_PREFIX:-snapshots}\nACCOUNT_NAME=${AZURE_STORAGE_ACCOUNT_NAME:?AZURE_STORAGE_ACCOUNT_NAME is required}\nACCOUNT_KEY=${AZURE_STORAGE_ACCOUNT_KEY:?AZURE_STORAGE_ACCOUNT_KEY is required}\nPDS_ID=${PDS_ID:-default}\nSENTINEL_PATH=${SENTINEL_PATH:-\"$DATA_DIR/.restore-complete\"}\nDOWNLOAD_PATH=\"$WORK_DIR/restore.tar.zst\"\n\nmkdir -p \"$DATA_DIR\" \"$WORK_DIR\"\n\nif [ \"$(find \"$DATA_DIR\" -mindepth 1 -print -quit 2>/dev/null)\" ]; then\n  echo \"[restore] Data directory already populated; skipping snapshot restore.\"\n  touch \"$SENTINEL_PATH\"\n  exit 0\nfi\n\necho \"[restore] Looking for latest snapshot in container '$SNAPSHOT_CONTAINER' with prefix '$SNAPSHOT_PREFIX/$PDS_ID'\"\nLATEST_BLOB=$(az storage blob list \\\n  --account-name \"$ACCOUNT_NAME\" \\\n  --account-key \"$ACCOUNT_KEY\" \\\n  --container-name \"$SNAPSHOT_CONTAINER\" \\\n  --prefix \"$SNAPSHOT_PREFIX/$PDS_ID/\" \\\n  --query \"max_by(@, &properties.lastModified).name\" -o tsv 2>/dev/null || true)\n\nif [ -z \"${LATEST_BLOB:-}\" ]; then\n  echo \"[restore] No snapshots found; starting with empty state.\"\n  touch \"$SENTINEL_PATH\"\n  exit 0\nfi\n\necho \"[restore] Downloading snapshot blob $LATEST_BLOB\"\naz storage blob download \\\n  --account-name \"$ACCOUNT_NAME\" \\\n  --account-key \"$ACCOUNT_KEY\" \\\n  --container-name \"$SNAPSHOT_CONTAINER\" \\\n  --name \"$LATEST_BLOB\" \\\n  --file \"$DOWNLOAD_PATH\" \\\n  --overwrite true >/dev/null\n\nif [ ! -s \"$DOWNLOAD_PATH\" ]; then\n  echo \"[restore] Downloaded archive is empty; aborting.\"\n  exit 1\nfi\n\necho \"[restore] Extracting archive into $DATA_DIR\"\nrm -rf \"$DATA_DIR\"/*\nzstd -d -c \"$DOWNLOAD_PATH\" | tar -x -C \"$DATA_DIR\"\n\ntouch \"$SENTINEL_PATH\"\necho \"[restore] Restore complete.\"\n",
-    "backupLoopScriptContent": "#!/usr/bin/env sh\nset -euo pipefail\n\nDATA_DIR=${DATA_DIR:-/data}\nWORK_DIR=${WORK_DIR:-/work}\nACCOUNT_NAME=${AZURE_STORAGE_ACCOUNT_NAME:?AZURE_STORAGE_ACCOUNT_NAME is required}\nACCOUNT_KEY=${AZURE_STORAGE_ACCOUNT_KEY:?AZURE_STORAGE_ACCOUNT_KEY is required}\nSNAPSHOT_CONTAINER=${SNAPSHOT_CONTAINER:-pds-sqlite}\nSNAPSHOT_PREFIX=${SNAPSHOT_PREFIX:-snapshots}\nPDS_ID=${PDS_ID:-default}\nINTERVAL_SECONDS=${INTERVAL_SECONDS:-15}\nRETAIN_COUNT=${RETAIN_COUNT:-200}\nSENTINEL_PATH=${SENTINEL_PATH:-\"$DATA_DIR/.restore-complete\"}\n\nmkdir -p \"$WORK_DIR\"\n\ncleanup() {\n  rm -rf \"$WORK_DIR\"/snapshot-* \"$WORK_DIR\"/archive-*.tar.zst 2>/dev/null || true\n}\n\ntrap cleanup EXIT INT TERM\n\nwait_for_restore() {\n  while [ ! -f \"$SENTINEL_PATH\" ]; do\n    echo \"[backup] Waiting for restore sentinel at $SENTINEL_PATH\"\n    sleep 2\n  done\n}\n\nsnapshot_iteration() {\n  TS=$(date -u +\"%Y%m%d-%H%M%S\")\n  STAGING=\"$WORK_DIR/snapshot-$TS\"\n  ARCHIVE=\"$WORK_DIR/archive-$TS.tar.zst\"\n\n  rm -rf \"$STAGING\"\n  mkdir -p \"$STAGING\"\n\n  echo \"[backup] Creating staging copy of $DATA_DIR\"\n  tar -C \"$DATA_DIR\" -cf - . | tar -C \"$STAGING\" -xf -\n  find \"$STAGING\" -type f \\( -name \"*.sqlite\" -o -name \"*.sqlite-wal\" -o -name \"*.sqlite-shm\" \\) -delete\n\n  echo \"[backup] Refreshing SQLite backups\"\n  find \"$DATA_DIR\" -type f -name \"*.sqlite\" | while read -r DB; do\n    TARGET=\"$STAGING${DB#$DATA_DIR}\"\n    mkdir -p \"$(dirname \"$TARGET\")\"\n    sqlite3 \"$DB\" \".backup '$TARGET'\"\n  done\n\n  echo \"[backup] Packaging snapshot\"\n  tar -C \"$STAGING\" -I \"zstd -3\" -cf \"$ARCHIVE\" .\n\n  BLOB_NAME=\"$SNAPSHOT_PREFIX/$PDS_ID/snap-$TS.tar.zst\"\n  echo \"[backup] Uploading $BLOB_NAME\"\n  az storage blob upload \\\n    --account-name \"$ACCOUNT_NAME\" \\\n    --account-key \"$ACCOUNT_KEY\" \\\n    --container-name \"$SNAPSHOT_CONTAINER\" \\\n    --name \"$BLOB_NAME\" \\\n    --file \"$ARCHIVE\" \\\n    --overwrite true >/dev/null\n\n  echo \"[backup] Enforcing retention (keep last $RETAIN_COUNT)\"\n  az storage blob list \\\n    --account-name \"$ACCOUNT_NAME\" \\\n    --account-key \"$ACCOUNT_KEY\" \\\n    --container-name \"$SNAPSHOT_CONTAINER\" \\\n    --prefix \"$SNAPSHOT_PREFIX/$PDS_ID/\" \\\n    --query \"sort_by(@, &name)[].name\" -o tsv |\n    awk -v keep=\"$RETAIN_COUNT\" 'NF==0 { next } { lines[NR]=$0 } END { for(i=1;i<=NR-keep;i++){ if(lines[i]!=\"\") print lines[i]; } }' |\n    while read -r OLD_BLOB; do\n      echo \"[backup] Deleting old snapshot $OLD_BLOB\"\n      az storage blob delete \\\n        --account-name \"$ACCOUNT_NAME\" \\\n        --account-key \"$ACCOUNT_KEY\" \\\n        --container-name \"$SNAPSHOT_CONTAINER\" \\\n        --name \"$OLD_BLOB\" >/dev/null || true\n    done\n}\n\nwait_for_restore\n\necho \"[backup] Starting continuous snapshot loop (interval ${INTERVAL_SECONDS}s)\"\nwhile true; do\n  snapshot_iteration || echo \"[backup] Snapshot iteration failed\"\n  cleanup\n  sleep \"$INTERVAL_SECONDS\"\ndone\n",
+    "backupJobScriptContent": "#!/usr/bin/env sh\nset -euo pipefail\n\nDATA_DIR=${DATA_DIR:-/data}\nWORK_DIR=${WORK_DIR:-/work}\nACCOUNT_NAME=${AZURE_STORAGE_ACCOUNT_NAME:?AZURE_STORAGE_ACCOUNT_NAME is required}\nACCOUNT_KEY=${AZURE_STORAGE_ACCOUNT_KEY:?AZURE_STORAGE_ACCOUNT_KEY is required}\nSNAPSHOT_CONTAINER=${SNAPSHOT_CONTAINER:-pds-sqlite}\nSNAPSHOT_PREFIX=${SNAPSHOT_PREFIX:-snapshots}\nPDS_ID=${PDS_ID:-default}\nRETAIN_COUNT=${RETAIN_COUNT:-200}\n\nmkdir -p \"$WORK_DIR\"\n\ncleanup() {\n  rm -rf \"$WORK_DIR\"/snapshot-* \"$WORK_DIR\"/archive-*.tar.zst 2>/dev/null || true\n}\n\ntrap cleanup EXIT INT TERM\n\nsnapshot_iteration() {\n  TS=$(date -u +\"%Y%m%d-%H%M%S\")\n  STAGING=\"$WORK_DIR/snapshot-$TS\"\n  ARCHIVE=\"$WORK_DIR/archive-$TS.tar.zst\"\n\n  rm -rf \"$STAGING\"\n  mkdir -p \"$STAGING\"\n\n  echo \"[backup-job] Creating staging copy of $DATA_DIR\"\n  tar -C \"$DATA_DIR\" -cf - . | tar -C \"$STAGING\" -xf -\n  find \"$STAGING\" -type f \\( -name \"*.sqlite\" -o -name \"*.sqlite-wal\" -o -name \"*.sqlite-shm\" \\) -delete\n\n  echo \"[backup-job] Refreshing SQLite backups\"\n  find \"$DATA_DIR\" -type f -name \"*.sqlite\" | while read -r DB; do\n    TARGET=\"$STAGING${DB#$DATA_DIR}\"\n    mkdir -p \"$(dirname \"$TARGET\")\"\n    sqlite3 \"$DB\" \".backup '$TARGET'\"\n  done\n\n  echo \"[backup-job] Packaging snapshot\"\n  tar -C \"$STAGING\" -I \"zstd -3\" -cf \"$ARCHIVE\" .\n\n  BLOB_NAME=\"$SNAPSHOT_PREFIX/$PDS_ID/snap-$TS.tar.zst\"\n  echo \"[backup-job] Uploading $BLOB_NAME\"\n  az storage blob upload \\\n    --account-name \"$ACCOUNT_NAME\" \\\n    --account-key \"$ACCOUNT_KEY\" \\\n    --container-name \"$SNAPSHOT_CONTAINER\" \\\n    --name \"$BLOB_NAME\" \\\n    --file \"$ARCHIVE\" \\\n    --overwrite true >/dev/null\n\n  echo \"[backup-job] Enforcing retention (keep last $RETAIN_COUNT)\"\n  az storage blob list \\\n    --account-name \"$ACCOUNT_NAME\" \\\n    --account-key \"$ACCOUNT_KEY\" \\\n    --container-name \"$SNAPSHOT_CONTAINER\" \\\n    --prefix \"$SNAPSHOT_PREFIX/$PDS_ID/\" \\\n    --query \"sort_by(@, &name)[].name\" -o tsv |\n    awk -v keep=\"$RETAIN_COUNT\" 'NF==0 { next } { lines[NR]=$0 } END { for(i=1;i<=NR-keep;i++){ if(lines[i]!=\"\") print lines[i]; } }' |\n    while read -r OLD_BLOB; do\n      echo \"[backup-job] Deleting old snapshot $OLD_BLOB\"\n      az storage blob delete \\\n        --account-name \"$ACCOUNT_NAME\" \\\n        --account-key \"$ACCOUNT_KEY\" \\\n        --container-name \"$SNAPSHOT_CONTAINER\" \\\n        --name \"$OLD_BLOB\" >/dev/null || true\n    done\n}\n\necho \"[backup-job] Running single snapshot iteration\"\nsnapshot_iteration\ncleanup\necho \"[backup-job] Backup iteration complete\"\n",
+    "restoreScriptB64": "[base64(variables('backupRestoreScriptContent'))]",
+    "backupJobScriptB64": "[base64(variables('backupJobScriptContent'))]",
     "computedEmailFromAddress": "[if(variables('hasEmailFromOverride'), parameters('emailFromAddress'), if(and(parameters('enableCommunicationServices'), not(equals(parameters('emailCustomDomain'), ''))), format('donotreply@{0}', parameters('emailCustomDomain')), if(parameters('enableCommunicationServices'), 'donotreply@placeholder.azurecomm.net', 'donotreply@example.com')))]",
     "smtpPlaceholderValue": "smtps://pending-update@smtp.azurecomm.net:587"
   },
@@ -391,88 +422,19 @@
               "command": [
                 "/bin/sh",
                 "-c",
-                "while [ ! -f /pds/.restore-complete ]; do echo \"waiting for snapshot restore\"; sleep 2; done; exec node --enable-source-maps index.js"
+                "printf \"%s\" \"$RESTORE_SCRIPT_B64\" | base64 -d > /scripts/restore.sh; chmod +x /scripts/restore.sh; /scripts/restore.sh; exec node --enable-source-maps index.js"
               ],
               "volumeMounts": [
                 {
                   "volumeName": "pds-data",
                   "mountPath": "/pds"
-                }
-              ],
-              "env": "[concat(createArray(createObject('name', 'PDS_PORT', 'value', '2583'), createObject('name', 'PDS_HOSTNAME', 'value', parameters('pdsHostname')), createObject('name', 'PDS_DATA_DIRECTORY', 'value', '/pds'), createObject('name', 'PDS_ACTOR_STORE_DIRECTORY', 'value', '/pds/actors'), createObject('name', 'PDS_BLOBSTORE_DISK_LOCATION', 'value', '/pds/blobs'), createObject('name', 'PDS_BLOBSTORE_DISK_TMP_LOCATION', 'value', '/pds/blobs/tmp'), createObject('name', 'PDS_EMAIL_FROM_ADDRESS', 'secretRef', 'pds-email-from-address'), createObject('name', 'PDS_JWT_SECRET', 'secretRef', 'pds-jwt-secret'), createObject('name', 'PDS_ADMIN_PASSWORD', 'secretRef', 'pds-admin-password'), createObject('name', 'PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX', 'secretRef', 'pds-plc-key')), if(variables('includeSmtpSecret'), createArray(createObject('name', 'PDS_EMAIL_SMTP_URL', 'secretRef', 'pds-smtp-secret')), createArray()))]"
-            },
-            {
-              "name": "snapshot-agent",
-              "image": "mcr.microsoft.com/azure-cli:2.64.0",
-              "resources": {
-                "cpu": "[json('0.25')]",
-                "memory": "0.5Gi"
-              },
-              "command": [
-                "/bin/sh",
-                "-c",
-                "set -euo pipefail; echo \"[snapshot-agent] Detecting package manager\"; if command -v apt-get >/dev/null 2>&1; then echo \"[snapshot-agent] Installing deps via apt-get\"; DEBIAN_FRONTEND=noninteractive apt-get update >/dev/null && DEBIAN_FRONTEND=noninteractive apt-get install -y sqlite3 zstd tar gawk >/dev/null; elif command -v apk >/dev/null 2>&1; then echo \"[snapshot-agent] Installing deps via apk\"; apk add --no-cache sqlite zstd tar gawk; elif command -v microdnf >/dev/null 2>&1; then echo \"[snapshot-agent] Installing deps via microdnf\"; microdnf install -y sqlite zstd tar gawk; elif command -v dnf >/dev/null 2>&1; then echo \"[snapshot-agent] Installing deps via dnf\"; dnf install -y sqlite zstd tar gawk; elif command -v yum >/dev/null 2>&1; then echo \"[snapshot-agent] Installing deps via yum\"; yum install -y sqlite zstd tar gawk; elif command -v tdnf >/dev/null 2>&1; then echo \"[snapshot-agent] Installing deps via tdnf\"; tdnf install -y sqlite tar gawk zstd; else echo \"ERROR: no supported package manager found\" >&2; exit 1; fi; printf \"%s\" \"$RESTORE_SCRIPT_B64\" | base64 -d > /scripts/restore.sh; printf \"%s\" \"$BACKUP_LOOP_SCRIPT_B64\" | base64 -d > /scripts/backup-loop.sh; chmod +x /scripts/*.sh; /scripts/restore.sh && exec /scripts/backup-loop.sh"
-              ],
-              "env": [
-                {
-                  "name": "AZURE_STORAGE_ACCOUNT_NAME",
-                  "value": "[variables('storageAccountName')]"
                 },
                 {
-                  "name": "AZURE_STORAGE_ACCOUNT_KEY",
-                  "secretRef": "storage-account-key"
-                },
-                {
-                  "name": "SNAPSHOT_CONTAINER",
-                  "value": "[parameters('snapshotContainerName')]"
-                },
-                {
-                  "name": "SNAPSHOT_PREFIX",
-                  "value": "[parameters('snapshotPrefix')]"
-                },
-                {
-                  "name": "RESTORE_SCRIPT_B64",
-                  "value": "[base64(variables('backupRestoreScriptContent'))]"
-                },
-                {
-                  "name": "BACKUP_LOOP_SCRIPT_B64",
-                  "value": "[base64(variables('backupLoopScriptContent'))]"
-                },
-                {
-                  "name": "PDS_ID",
-                  "value": "[parameters('namePrefix')]"
-                },
-                {
-                  "name": "INTERVAL_SECONDS",
-                  "value": "[string(parameters('backupIntervalSeconds'))]"
-                },
-                {
-                  "name": "RETAIN_COUNT",
-                  "value": "[string(parameters('backupRetentionCount'))]"
-                },
-                {
-                  "name": "DATA_DIR",
-                  "value": "/data"
-                },
-                {
-                  "name": "WORK_DIR",
-                  "value": "/work"
-                },
-                {
-                  "name": "SENTINEL_PATH",
-                  "value": "/data/.restore-complete"
-                }
-              ],
-              "volumeMounts": [
-                {
-                  "volumeName": "pds-data",
-                  "mountPath": "/data"
-                },
-                {
-                  "volumeName": "backup-scripts",
+                  "volumeName": "scripts",
                   "mountPath": "/scripts"
                 }
-              ]
+              ],
+              "env": "[concat(createArray(createObject('name', 'PDS_PORT', 'value', '2583'), createObject('name', 'PDS_HOSTNAME', 'value', parameters('pdsHostname')), createObject('name', 'PDS_DATA_DIRECTORY', 'value', '/pds'), createObject('name', 'PDS_ACTOR_STORE_DIRECTORY', 'value', '/pds/actors'), createObject('name', 'PDS_BLOBSTORE_DISK_LOCATION', 'value', '/pds/blobs'), createObject('name', 'PDS_BLOBSTORE_DISK_TMP_LOCATION', 'value', '/pds/blobs/tmp'), createObject('name', 'PDS_BSKY_APP_VIEW_URL', 'value', parameters('pdsBskyAppViewUrl')), createObject('name', 'PDS_BSKY_APP_VIEW_DID', 'value', parameters('pdsBskyAppViewDid')), createObject('name', 'PDS_REPORT_SERVICE_URL', 'value', parameters('pdsReportServiceUrl')), createObject('name', 'PDS_REPORT_SERVICE_DID', 'value', parameters('pdsReportServiceDid')), createObject('name', 'PDS_CRAWLERS', 'value', parameters('pdsCrawlers')), createObject('name', 'PDS_DID_PLC_URL', 'value', parameters('pdsDidPlcUrl')), createObject('name', 'PDS_EMAIL_FROM_ADDRESS', 'secretRef', 'pds-email-from-address'), createObject('name', 'PDS_JWT_SECRET', 'secretRef', 'pds-jwt-secret'), createObject('name', 'PDS_ADMIN_PASSWORD', 'secretRef', 'pds-admin-password'), createObject('name', 'PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX', 'secretRef', 'pds-plc-key'), createObject('name', 'RESTORE_SCRIPT_B64', 'value', variables('restoreScriptB64')), createObject('name', 'AZURE_STORAGE_ACCOUNT_NAME', 'value', variables('storageAccountName')), createObject('name', 'AZURE_STORAGE_ACCOUNT_KEY', 'secretRef', 'storage-account-key'), createObject('name', 'SNAPSHOT_CONTAINER', 'value', parameters('snapshotContainerName')), createObject('name', 'SNAPSHOT_PREFIX', 'value', parameters('snapshotPrefix')), createObject('name', 'PDS_ID', 'value', parameters('namePrefix')), createObject('name', 'DATA_DIR', 'value', '/pds'), createObject('name', 'WORK_DIR', 'value', '/pds/work'), createObject('name', 'SENTINEL_PATH', 'value', '/pds/.restore-complete')), if(variables('includeSmtpSecret'), createArray(createObject('name', 'PDS_EMAIL_SMTP_URL', 'secretRef', 'pds-smtp-secret')), createArray()))]"
             }
           ],
           "scale": {
@@ -485,7 +447,7 @@
               "storageType": "EmptyDir"
             },
             {
-              "name": "backup-scripts",
+              "name": "scripts",
               "storageType": "EmptyDir"
             }
           ]
@@ -499,34 +461,6 @@
         "[resourceId('Microsoft.App/managedEnvironments', variables('managedEnvName'))]",
         "[resourceId('Microsoft.KeyVault/vaults/secrets', variables('keyVaultName'), parameters('smtpSecretName'))]",
         "[resourceId('Microsoft.Storage/storageAccounts', variables('storageAccountName'))]"
-      ]
-    },
-    {
-      "condition": "[variables('managedCertificateEnabled')]",
-      "type": "Microsoft.App/containerApps/customDomains",
-      "apiVersion": "2024-03-01",
-      "name": "[format('{0}/{1}', variables('containerAppName'), parameters('pdsHostname'))]",
-      "properties": {
-        "bindingType": "Disabled"
-      },
-      "dependsOn": [
-        "[resourceId('Microsoft.App/containerApps', variables('containerAppName'))]"
-      ]
-    },
-    {
-      "condition": "[variables('managedCertificateEnabled')]",
-      "type": "Microsoft.App/managedEnvironments/managedCertificates",
-      "apiVersion": "2024-03-01",
-      "name": "[format('{0}/{1}', variables('managedEnvName'), variables('managedCertificateName'))]",
-      "location": "[parameters('location')]",
-      "properties": {
-        "subjectName": "[parameters('pdsHostname')]",
-        "domainControlValidation": "TXT"
-      },
-      "dependsOn": [
-        "[resourceId('Microsoft.App/containerApps/customDomains', variables('containerAppName'), parameters('pdsHostname'))]",
-        "[resourceId('Microsoft.Network/dnsZones/TXT', parameters('dnsZoneName'), format('asuid.{0}', parameters('dnsRecordName')))]",
-        "[resourceId('Microsoft.App/managedEnvironments', variables('managedEnvName'))]"
       ]
     },
     {
@@ -569,6 +503,110 @@
       "dependsOn": [
         "[resourceId('Microsoft.App/containerApps', variables('containerAppName'))]",
         "[resourceId('Microsoft.OperationalInsights/workspaces', variables('logAnalyticsName'))]"
+      ]
+    },
+    {
+      "type": "Microsoft.App/jobs",
+      "apiVersion": "2024-03-01",
+      "name": "[format('{0}-pds-backup-job', parameters('namePrefix'))]",
+      "location": "[parameters('location')]",
+      "identity": {
+        "type": "UserAssigned",
+        "userAssignedIdentities": {
+          "[format('{0}', resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('containerAppIdentityName')))]": {}
+        }
+      },
+      "properties": {
+        "environmentId": "[resourceId('Microsoft.App/managedEnvironments', variables('managedEnvName'))]",
+        "configuration": {
+          "triggerType": "Schedule",
+          "replicaTimeout": 600,
+          "secrets": [
+            {
+              "name": "storage-account-key",
+              "keyVaultUrl": "[format('{0}secrets/{1}', reference(resourceId('Microsoft.KeyVault/vaults', variables('keyVaultName')), '2023-07-01').vaultUri, variables('storageAccountKeySecretName'))]",
+              "identity": "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('containerAppIdentityName'))]"
+            }
+          ],
+          "scheduleTriggerConfig": {
+            "cronExpression": "*/5 * * * *",
+            "parallelism": 1,
+            "replicaCompletionCount": 1
+          }
+        },
+        "template": {
+          "containers": [
+            {
+              "name": "backup-job",
+              "image": "mcr.microsoft.com/azure-cli:2.64.0",
+              "resources": {
+                "cpu": "[json('0.5')]",
+                "memory": "1Gi"
+              },
+              "command": [
+                "/bin/sh",
+                "-c",
+                "set -euo pipefail; echo \"[backup-job-init] Detecting package manager\"; if command -v apt-get >/dev/null 2>&1; then echo \"[backup-job-init] Installing deps via apt-get\"; DEBIAN_FRONTEND=noninteractive apt-get update >/dev/null && DEBIAN_FRONTEND=noninteractive apt-get install -y sqlite3 zstd tar gawk >/dev/null; elif command -v apk >/dev/null 2>&1; then echo \"[backup-job-init] Installing deps via apk\"; apk add --no-cache sqlite zstd tar gawk; elif command -v microdnf >/dev/null 2>&1; then echo \"[backup-job-init] Installing deps via microdnf\"; microdnf install -y sqlite zstd tar gawk; elif command -v dnf >/dev/null 2>&1; then echo \"[backup-job-init] Installing deps via dnf\"; dnf install -y sqlite zstd tar gawk; elif command -v yum >/dev/null 2>&1; then echo \"[backup-job-init] Installing deps via yum\"; yum install -y sqlite zstd tar gawk; elif command -v tdnf >/dev/null 2>&1; then echo \"[backup-job-init] Installing deps via tdnf\"; tdnf install -y sqlite tar gawk zstd; else echo \"ERROR: no supported package manager found\" >&2; exit 1; fi; printf \"%s\" \"$BACKUP_JOB_SCRIPT_B64\" | base64 -d > /scripts/backup-job.sh; chmod +x /scripts/backup-job.sh; exec /scripts/backup-job.sh"
+              ],
+              "env": [
+                {
+                  "name": "AZURE_STORAGE_ACCOUNT_NAME",
+                  "value": "[variables('storageAccountName')]"
+                },
+                {
+                  "name": "AZURE_STORAGE_ACCOUNT_KEY",
+                  "secretRef": "storage-account-key"
+                },
+                {
+                  "name": "SNAPSHOT_CONTAINER",
+                  "value": "[parameters('snapshotContainerName')]"
+                },
+                {
+                  "name": "SNAPSHOT_PREFIX",
+                  "value": "[parameters('snapshotPrefix')]"
+                },
+                {
+                  "name": "BACKUP_JOB_SCRIPT_B64",
+                  "value": "[variables('backupJobScriptB64')]"
+                },
+                {
+                  "name": "PDS_ID",
+                  "value": "[parameters('namePrefix')]"
+                },
+                {
+                  "name": "RETAIN_COUNT",
+                  "value": "[string(parameters('backupRetentionCount'))]"
+                },
+                {
+                  "name": "DATA_DIR",
+                  "value": "/data"
+                },
+                {
+                  "name": "WORK_DIR",
+                  "value": "/work"
+                }
+              ],
+              "volumeMounts": [
+                {
+                  "volumeName": "pds-data",
+                  "mountPath": "/data"
+                }
+              ]
+            }
+          ],
+          "volumes": [
+            {
+              "name": "pds-data",
+              "storageType": "EmptyDir"
+            }
+          ]
+        }
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('containerAppIdentityName'))]",
+        "[resourceId('Microsoft.KeyVault/vaults', variables('keyVaultName'))]",
+        "[resourceId('Microsoft.App/managedEnvironments', variables('managedEnvName'))]",
+        "[resourceId('Microsoft.Storage/storageAccounts', variables('storageAccountName'))]"
       ]
     },
     {
@@ -689,7 +727,7 @@
       "properties": {
         "TTL": 300,
         "CNAMERecord": {
-          "cname": "[reference(resourceId('Microsoft.App/containerApps', variables('containerAppName')), '2023-05-01', 'full').properties.configuration.ingress.fqdn]"
+          "cname": "[reference(resourceId('Microsoft.App/containerApps', variables('containerAppName')), '2023-05-01').configuration.ingress.fqdn]"
         }
       },
       "dependsOn": [
@@ -705,7 +743,7 @@
       "properties": {
         "TTL": 300,
         "CNAMERecord": {
-          "cname": "[reference(resourceId('Microsoft.App/containerApps', variables('containerAppName')), '2023-05-01', 'full').properties.configuration.ingress.fqdn]"
+          "cname": "[reference(resourceId('Microsoft.App/containerApps', variables('containerAppName')), '2023-05-01').configuration.ingress.fqdn]"
         }
       },
       "dependsOn": [
@@ -732,76 +770,6 @@
         "[resourceId('Microsoft.App/containerApps', variables('containerAppName'))]",
         "[resourceId('Microsoft.Network/dnsZones', parameters('dnsZoneName'))]"
       ]
-    },
-    {
-      "condition": "[variables('managedCertificateEnabled')]",
-      "type": "Microsoft.Resources/deployments",
-      "apiVersion": "2025-04-01",
-      "name": "[format('{0}-enable-sni', parameters('namePrefix'))]",
-      "properties": {
-        "expressionEvaluationOptions": {
-          "scope": "inner"
-        },
-        "mode": "Incremental",
-        "parameters": {
-          "containerAppName": {
-            "value": "[variables('containerAppName')]"
-          },
-          "hostname": {
-            "value": "[parameters('pdsHostname')]"
-          },
-          "certificateId": {
-            "value": "[variables('managedCertificateResourceId')]"
-          }
-        },
-        "template": {
-          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
-          "contentVersion": "1.0.0.0",
-          "metadata": {
-            "_generator": {
-              "name": "bicep",
-              "version": "0.38.33.27573",
-              "templateHash": "16885970059261286595"
-            }
-          },
-          "parameters": {
-            "containerAppName": {
-              "type": "string",
-              "metadata": {
-                "description": "Name of the Container App to update with the managed certificate binding."
-              }
-            },
-            "hostname": {
-              "type": "string",
-              "metadata": {
-                "description": "Hostname to bind to the Container App."
-              }
-            },
-            "certificateId": {
-              "type": "string",
-              "metadata": {
-                "description": "Resource ID of the managed certificate to associate with the hostname binding."
-              }
-            }
-          },
-          "resources": [
-            {
-              "type": "Microsoft.App/containerApps/customDomains",
-              "apiVersion": "2024-03-01",
-              "name": "[format('{0}/{1}', parameters('containerAppName'), parameters('hostname'))]",
-              "properties": {
-                "bindingType": "SniEnabled",
-                "certificateId": "[parameters('certificateId')]"
-              }
-            }
-          ]
-        }
-      },
-      "dependsOn": [
-        "[resourceId('Microsoft.App/containerApps/customDomains', variables('containerAppName'), parameters('pdsHostname'))]",
-        "[resourceId('Microsoft.Network/dnsZones/TXT', parameters('dnsZoneName'), format('asuid.{0}', parameters('dnsRecordName')))]",
-        "[resourceId('Microsoft.App/managedEnvironments/managedCertificates', variables('managedEnvName'), variables('managedCertificateName'))]"
-      ]
     }
   ],
   "outputs": {
@@ -811,7 +779,7 @@
     },
     "containerAppFqdn": {
       "type": "string",
-      "value": "[reference(resourceId('Microsoft.App/containerApps', variables('containerAppName')), '2023-05-01', 'full').properties.configuration.ingress.fqdn]"
+      "value": "[reference(resourceId('Microsoft.App/containerApps', variables('containerAppName')), '2023-05-01').configuration.ingress.fqdn]"
     },
     "storageAccountId": {
       "type": "string",
@@ -837,13 +805,13 @@
       "type": "string",
       "value": "[if(parameters('enableCommunicationServices'), variables('emailServiceName'), '')]"
     },
-    "managedCertificateResourceId": {
+    "certificateResourceId": {
       "type": "string",
-      "value": "[if(variables('useManagedCertificate'), resourceId('Microsoft.App/managedEnvironments/managedCertificates', variables('managedEnvName'), variables('managedCertificateName')), variables('ingressCertificateResourceId'))]"
+      "value": "[parameters('certificateResourceId')]"
     },
     "containerAppCustomDomainVerificationId": {
       "type": "string",
-      "value": "[reference(resourceId('Microsoft.App/containerApps', variables('containerAppName')), '2023-05-01', 'full').properties.customDomainVerificationId]"
+      "value": "[reference(resourceId('Microsoft.App/containerApps', variables('containerAppName')), '2023-05-01').customDomainVerificationId]"
     },
     "smtpServer": {
       "type": "string",
