@@ -4,8 +4,8 @@
   "metadata": {
     "_generator": {
       "name": "bicep",
-      "version": "0.38.33.27573",
-      "templateHash": "598916211728286297"
+      "version": "0.39.26.7824",
+      "templateHash": "8189209922411740627"
     }
   },
   "parameters": {
@@ -56,14 +56,14 @@
     },
     "pdsCpu": {
       "type": "string",
-      "defaultValue": "0.5",
+      "defaultValue": "0.25",
       "metadata": {
         "description": "CPU request for the PDS container in cores."
       }
     },
     "pdsMemory": {
       "type": "string",
-      "defaultValue": "1Gi",
+      "defaultValue": "0.5Gi",
       "metadata": {
         "description": "Memory request for the PDS container."
       }
@@ -273,8 +273,8 @@
     "emailServiceName": "[format('{0}-email', parameters('namePrefix'))]",
     "hasEmailFromOverride": "[greater(length(parameters('emailFromAddress')), 0)]",
     "includeSmtpSecret": "[greater(length(parameters('smtpSecretName')), 0)]",
-    "backupRestoreScriptContent": "#!/usr/bin/env sh\nset -euo pipefail\n\nDATA_DIR=${DATA_DIR:-/data}\nWORK_DIR=${WORK_DIR:-/work}\nSNAPSHOT_CONTAINER=${SNAPSHOT_CONTAINER:-pds-sqlite}\nSNAPSHOT_PREFIX=${SNAPSHOT_PREFIX:-snapshots}\nACCOUNT_NAME=${AZURE_STORAGE_ACCOUNT_NAME:?AZURE_STORAGE_ACCOUNT_NAME is required}\nACCOUNT_KEY=${AZURE_STORAGE_ACCOUNT_KEY:?AZURE_STORAGE_ACCOUNT_KEY is required}\nPDS_ID=${PDS_ID:-default}\nSENTINEL_PATH=${SENTINEL_PATH:-\"$DATA_DIR/.restore-complete\"}\nDOWNLOAD_PATH=\"$WORK_DIR/restore.tar.zst\"\n\nmkdir -p \"$DATA_DIR\" \"$WORK_DIR\"\n\nif [ \"$(find \"$DATA_DIR\" -mindepth 1 -print -quit 2>/dev/null)\" ]; then\n  echo \"[restore] Data directory already populated; skipping snapshot restore.\"\n  touch \"$SENTINEL_PATH\"\n  exit 0\nfi\n\necho \"[restore] Looking for latest snapshot in container '$SNAPSHOT_CONTAINER' with prefix '$SNAPSHOT_PREFIX/$PDS_ID'\"\nLATEST_BLOB=$(az storage blob list \\\n  --account-name \"$ACCOUNT_NAME\" \\\n  --account-key \"$ACCOUNT_KEY\" \\\n  --container-name \"$SNAPSHOT_CONTAINER\" \\\n  --prefix \"$SNAPSHOT_PREFIX/$PDS_ID/\" \\\n  --query \"max_by(@, &properties.lastModified).name\" -o tsv 2>/dev/null || true)\n\nif [ -z \"${LATEST_BLOB:-}\" ]; then\n  echo \"[restore] No snapshots found; starting with empty state.\"\n  touch \"$SENTINEL_PATH\"\n  exit 0\nfi\n\necho \"[restore] Downloading snapshot blob $LATEST_BLOB\"\naz storage blob download \\\n  --account-name \"$ACCOUNT_NAME\" \\\n  --account-key \"$ACCOUNT_KEY\" \\\n  --container-name \"$SNAPSHOT_CONTAINER\" \\\n  --name \"$LATEST_BLOB\" \\\n  --file \"$DOWNLOAD_PATH\" \\\n  --overwrite true >/dev/null\n\nif [ ! -s \"$DOWNLOAD_PATH\" ]; then\n  echo \"[restore] Downloaded archive is empty; aborting.\"\n  exit 1\nfi\n\necho \"[restore] Extracting archive into $DATA_DIR\"\nrm -rf \"$DATA_DIR\"/*\nzstd -d -c \"$DOWNLOAD_PATH\" | tar -x -C \"$DATA_DIR\"\n\ntouch \"$SENTINEL_PATH\"\necho \"[restore] Restore complete.\"\n",
-    "backupJobScriptContent": "#!/usr/bin/env sh\nset -euo pipefail\n\nDATA_DIR=${DATA_DIR:-/data}\nWORK_DIR=${WORK_DIR:-/work}\nACCOUNT_NAME=${AZURE_STORAGE_ACCOUNT_NAME:?AZURE_STORAGE_ACCOUNT_NAME is required}\nACCOUNT_KEY=${AZURE_STORAGE_ACCOUNT_KEY:?AZURE_STORAGE_ACCOUNT_KEY is required}\nSNAPSHOT_CONTAINER=${SNAPSHOT_CONTAINER:-pds-sqlite}\nSNAPSHOT_PREFIX=${SNAPSHOT_PREFIX:-snapshots}\nPDS_ID=${PDS_ID:-default}\nRETAIN_COUNT=${RETAIN_COUNT:-200}\n\nmkdir -p \"$WORK_DIR\"\n\ncleanup() {\n  rm -rf \"$WORK_DIR\"/snapshot-* \"$WORK_DIR\"/archive-*.tar.zst 2>/dev/null || true\n}\n\ntrap cleanup EXIT INT TERM\n\nsnapshot_iteration() {\n  TS=$(date -u +\"%Y%m%d-%H%M%S\")\n  STAGING=\"$WORK_DIR/snapshot-$TS\"\n  ARCHIVE=\"$WORK_DIR/archive-$TS.tar.zst\"\n\n  rm -rf \"$STAGING\"\n  mkdir -p \"$STAGING\"\n\n  echo \"[backup-job] Creating staging copy of $DATA_DIR\"\n  tar -C \"$DATA_DIR\" -cf - . | tar -C \"$STAGING\" -xf -\n  find \"$STAGING\" -type f \\( -name \"*.sqlite\" -o -name \"*.sqlite-wal\" -o -name \"*.sqlite-shm\" \\) -delete\n\n  echo \"[backup-job] Refreshing SQLite backups\"\n  find \"$DATA_DIR\" -type f -name \"*.sqlite\" | while read -r DB; do\n    TARGET=\"$STAGING${DB#$DATA_DIR}\"\n    mkdir -p \"$(dirname \"$TARGET\")\"\n    sqlite3 \"$DB\" \".backup '$TARGET'\"\n  done\n\n  echo \"[backup-job] Packaging snapshot\"\n  tar -C \"$STAGING\" -I \"zstd -3\" -cf \"$ARCHIVE\" .\n\n  BLOB_NAME=\"$SNAPSHOT_PREFIX/$PDS_ID/snap-$TS.tar.zst\"\n  echo \"[backup-job] Uploading $BLOB_NAME\"\n  az storage blob upload \\\n    --account-name \"$ACCOUNT_NAME\" \\\n    --account-key \"$ACCOUNT_KEY\" \\\n    --container-name \"$SNAPSHOT_CONTAINER\" \\\n    --name \"$BLOB_NAME\" \\\n    --file \"$ARCHIVE\" \\\n    --overwrite true >/dev/null\n\n  echo \"[backup-job] Enforcing retention (keep last $RETAIN_COUNT)\"\n  az storage blob list \\\n    --account-name \"$ACCOUNT_NAME\" \\\n    --account-key \"$ACCOUNT_KEY\" \\\n    --container-name \"$SNAPSHOT_CONTAINER\" \\\n    --prefix \"$SNAPSHOT_PREFIX/$PDS_ID/\" \\\n    --query \"sort_by(@, &name)[].name\" -o tsv |\n    awk -v keep=\"$RETAIN_COUNT\" 'NF==0 { next } { lines[NR]=$0 } END { for(i=1;i<=NR-keep;i++){ if(lines[i]!=\"\") print lines[i]; } }' |\n    while read -r OLD_BLOB; do\n      echo \"[backup-job] Deleting old snapshot $OLD_BLOB\"\n      az storage blob delete \\\n        --account-name \"$ACCOUNT_NAME\" \\\n        --account-key \"$ACCOUNT_KEY\" \\\n        --container-name \"$SNAPSHOT_CONTAINER\" \\\n        --name \"$OLD_BLOB\" >/dev/null || true\n    done\n}\n\necho \"[backup-job] Running single snapshot iteration\"\nsnapshot_iteration\ncleanup\necho \"[backup-job] Backup iteration complete\"\n",
+    "backupRestoreScriptContent": "#!/usr/bin/env sh\nset -euo pipefail\n\n# Restore script using Azure Storage REST API (curl + openssl)\n\nDATA_DIR=${DATA_DIR:-/data}\nWORK_DIR=${WORK_DIR:-/work}\nSNAPSHOT_CONTAINER=${SNAPSHOT_CONTAINER:-pds-sqlite}\nSNAPSHOT_PREFIX=${SNAPSHOT_PREFIX:-snapshots}\nACCOUNT_NAME=${AZURE_STORAGE_ACCOUNT_NAME:?AZURE_STORAGE_ACCOUNT_NAME is required}\nACCOUNT_KEY=${AZURE_STORAGE_ACCOUNT_KEY:?AZURE_STORAGE_ACCOUNT_KEY is required}\nPDS_ID=${PDS_ID:-default}\nSENTINEL_PATH=${SENTINEL_PATH:-\"$DATA_DIR/.restore-complete\"}\nDOWNLOAD_PATH=\"$WORK_DIR/restore.tar.zst\"\n\nmkdir -p \"$DATA_DIR\" \"$WORK_DIR\"\n\nif [ -f \"$DATA_DIR/pds.sqlite\" ] || [ -d \"$DATA_DIR/actors\" ]; then\n  echo \"[restore] Data directory already populated; skipping snapshot restore.\"\n  touch \"$SENTINEL_PATH\"\n  exit 0\nfi\n\nif [ -f \"$SENTINEL_PATH\" ]; then\n  echo \"[restore] Restore sentinel exists; skipping snapshot restore.\"\n  exit 0\nfi\n\nbin2hex() {\n  od -A n -t x1 | tr -d ' \\n'\n}\n\nsign_request() {\n  local method=$1\n  local resource=$2\n  local query_params=$3\n  local headers=$4\n  local content_length=${5:-}\n  local content_type=${6:-}\n  \n  local date=$(date -u +\"%a, %d %b %Y %H:%M:%S GMT\")\n  local version=\"2021-06-08\"\n  \n  local canon_headers=\"x-ms-date:$date\\nx-ms-version:$version\"\n  local canon_res=\"/$ACCOUNT_NAME$resource\"\n  if [ -n \"$query_params\" ]; then\n    canon_res=\"$canon_res\\n$query_params\"\n  fi\n  \n  local string_to_sign=\"$method\\n\\n\\n$content_length\\n\\n$content_type\\n\\n\\n\\n\\n\\n\\n$canon_headers\\n$canon_res\"\n  local hex_key=$(echo -n \"$ACCOUNT_KEY\" | base64 -d | bin2hex)\n  local signature=$(echo -n -e \"$string_to_sign\" | openssl dgst -sha256 -mac HMAC -macopt hexkey:\"$hex_key\" -binary | base64 -w 0)\n  \n  echo \"Authorization: SharedKey $ACCOUNT_NAME:$signature\"\n  echo \"x-ms-date: $date\"\n  echo \"x-ms-version: $version\"\n}\n\necho \"[restore] Looking for latest snapshot in container '$SNAPSHOT_CONTAINER' with prefix '$SNAPSHOT_PREFIX/$PDS_ID'\"\n\n# List Blobs\n# CanonicalizedResource: /account/container\\ncomp:list\\nprefix:...\\nrestype:container\nprefix=\"$SNAPSHOT_PREFIX/$PDS_ID/\"\nquery_params=\"comp:list\\nprefix:$prefix\\nrestype:container\"\nauth_output=$(sign_request \"GET\" \"/$SNAPSHOT_CONTAINER\" \"$query_params\" \"\")\nauth_header=$(echo \"$auth_output\" | grep \"Authorization:\")\ndate_header=$(echo \"$auth_output\" | grep \"x-ms-date:\")\nversion_header=$(echo \"$auth_output\" | grep \"x-ms-version:\")\n\nlist_url=\"https://$ACCOUNT_NAME.blob.core.windows.net/$SNAPSHOT_CONTAINER?restype=container&comp=list&prefix=$prefix\"\n\n# Capture HTTP status code and body\n# We use a temporary file for the body to avoid pipe masking exit codes and to separate body from status\nresponse_body_file=$(mktemp)\nhttp_code=$(curl -s -w \"%{http_code}\" -X GET \\\n  -H \"$auth_header\" \\\n  -H \"$date_header\" \\\n  -H \"$version_header\" \\\n  -o \"$response_body_file\" \\\n  \"$list_url\")\n\nif [ \"$http_code\" != \"200\" ]; then\n  echo \"[restore] ERROR: Failed to list blobs. HTTP Status: $http_code\"\n  echo \"[restore] Response body:\"\n  cat \"$response_body_file\"\n  rm -f \"$response_body_file\"\n  exit 1\nfi\n\nlist_response=$(cat \"$response_body_file\")\nrm -f \"$response_body_file\"\n\n# Extract latest blob\n# Note: Alpine grep doesn't support -P, so we use sed\nLATEST_BLOB=$(echo \"$list_response\" | sed -n 's/.*<Name>\\(.*\\)<\\/Name>.*/\\1/p' | grep \"$SNAPSHOT_PREFIX/$PDS_ID/\" | sort | tail -1 || true)\n\nif [ -z \"${LATEST_BLOB:-}\" ]; then\n  # Check if the response was actually a valid empty list (contains <Blobs /> or <Blobs></Blobs> or just <Blobs>)\n  # If it's a valid XML response but no blobs match, that's fine.\n  # But if we got 200 OK, it should be valid XML.\n  echo \"[restore] No snapshots found matching prefix '$SNAPSHOT_PREFIX/$PDS_ID/'; starting with empty state.\"\n  touch \"$SENTINEL_PATH\"\n  exit 0\nfi\n\necho \"[restore] Downloading snapshot blob $LATEST_BLOB\"\n\n# Download Blob\nauth_output=$(sign_request \"GET\" \"/$SNAPSHOT_CONTAINER/$LATEST_BLOB\" \"\" \"\")\nauth_header=$(echo \"$auth_output\" | grep \"Authorization:\")\ndate_header=$(echo \"$auth_output\" | grep \"x-ms-date:\")\nversion_header=$(echo \"$auth_output\" | grep \"x-ms-version:\")\n\ncurl -s -X GET \\\n  -H \"$auth_header\" \\\n  -H \"$date_header\" \\\n  -H \"$version_header\" \\\n  -o \"$DOWNLOAD_PATH\" \\\n  \"https://$ACCOUNT_NAME.blob.core.windows.net/$SNAPSHOT_CONTAINER/$LATEST_BLOB\"\n\nif [ ! -s \"$DOWNLOAD_PATH\" ]; then\n  echo \"[restore] Downloaded archive is empty; aborting.\"\n  exit 1\nfi\n\necho \"[restore] Extracting archive into $DATA_DIR\"\nrm -rf \"$DATA_DIR\"/*\nzstd -d -c \"$DOWNLOAD_PATH\" | tar -x -C \"$DATA_DIR\"\n\ntouch \"$SENTINEL_PATH\"\necho \"[restore] Restore complete.\"",
+    "backupJobScriptContent": "#!/usr/bin/env sh\nset -euo pipefail\n\nDATA_DIR=${DATA_DIR:-/data}\nWORK_DIR=${WORK_DIR:-/work}\nACCOUNT_NAME=${AZURE_STORAGE_ACCOUNT_NAME:?AZURE_STORAGE_ACCOUNT_NAME is required}\nACCOUNT_KEY=${AZURE_STORAGE_ACCOUNT_KEY:?AZURE_STORAGE_ACCOUNT_KEY is required}\nSNAPSHOT_CONTAINER=${SNAPSHOT_CONTAINER:-pds-sqlite}\nSNAPSHOT_PREFIX=${SNAPSHOT_PREFIX:-snapshots}\nPDS_ID=${PDS_ID:-default}\nINTERVAL_SECONDS=${INTERVAL_SECONDS:-15}\nRETAIN_COUNT=${RETAIN_COUNT:-200}\nSENTINEL_PATH=${SENTINEL_PATH:-\"$DATA_DIR/.restore-complete\"}\n\nmkdir -p \"$WORK_DIR\"\n\ncleanup() {\n  rm -rf \"$WORK_DIR\"/snapshot-* \"$WORK_DIR\"/archive-*.tar.zst 2>/dev/null || true\n}\ntrap cleanup EXIT INT TERM\n\nwait_for_restore() {\n  while [ ! -f \"$SENTINEL_PATH\" ]; do\n    echo \"[backup] Waiting for restore sentinel at $SENTINEL_PATH\"\n    sleep 2\n  done\n}\n\nbin2hex() {\n  od -A n -t x1 | tr -d ' \\n'\n}\n\n# $1: method, $2: resource (e.g. /container/blob), $3: query params (newlines separated key:value), $4: headers (newlines separated key:value), $5: content-length, $6: content-type\nsign_request() {\n  local method=$1\n  local resource=$2\n  local query_params=$3\n  local headers=$4\n  local content_length=${5:-}\n  local content_type=${6:-}\n  \n  local date=$(date -u +\"%a, %d %b %Y %H:%M:%S GMT\")\n  local version=\"2021-06-08\"\n  \n  # Build CanonicalizedHeaders\n  # We assume only x-ms-date and x-ms-version and maybe x-ms-blob-type are used.\n  # Sort headers?\n  local canon_headers=\"\"\n  if echo \"$headers\" | grep -q \"x-ms-blob-type\"; then\n    local blob_type=$(echo \"$headers\" | grep \"x-ms-blob-type\" | cut -d: -f2 | tr -d ' ')\n    canon_headers=\"x-ms-blob-type:$blob_type\\n\"\n  fi\n  canon_headers=\"${canon_headers}x-ms-date:$date\\nx-ms-version:$version\"\n  \n  # Build CanonicalizedResource\n  local canon_res=\"/$ACCOUNT_NAME$resource\"\n  if [ -n \"$query_params\" ]; then\n    # Sort query params? We assume caller passes them sorted if needed, or we just append.\n    # Azure requires lexicographical order.\n    canon_res=\"$canon_res\\n$query_params\"\n  fi\n  \n  local string_to_sign=\"$method\\n\\n\\n$content_length\\n\\n$content_type\\n\\n\\n\\n\\n\\n\\n$canon_headers\\n$canon_res\"\n  \n  local hex_key=$(echo -n \"$ACCOUNT_KEY\" | base64 -d | bin2hex)\n  local signature=$(echo -n -e \"$string_to_sign\" | openssl dgst -sha256 -mac HMAC -macopt hexkey:\"$hex_key\" -binary | base64 -w 0)\n  \n  echo \"Authorization: SharedKey $ACCOUNT_NAME:$signature\"\n  echo \"x-ms-date: $date\"\n  echo \"x-ms-version: $version\"\n}\n\nsnapshot_iteration() {\n  TS=$(date -u +\"%Y%m%d-%H%M%S\")\n  STAGING=\"$WORK_DIR/snapshot-$TS\"\n  ARCHIVE=\"$WORK_DIR/archive-$TS.tar.zst\"\n\n  rm -rf \"$STAGING\"\n  mkdir -p \"$STAGING\"\n\n  echo \"[backup] Creating staging copy of $DATA_DIR\"\n  tar -C \"$DATA_DIR\" -cf - . | tar -C \"$STAGING\" -xf -\n  find \"$STAGING\" -type f \\( -name \"*.sqlite\" -o -name \"*.sqlite-wal\" -o -name \"*.sqlite-shm\" \\) -delete\n\n  echo \"[backup] Refreshing SQLite backups\"\n  find \"$DATA_DIR\" -type f -name \"*.sqlite\" | while read -r DB; do\n    TARGET=\"$STAGING${DB#$DATA_DIR}\"\n    mkdir -p \"$(dirname \"$TARGET\")\"\n    sqlite3 \"$DB\" \".backup '$TARGET'\"\n  done\n\n  echo \"[backup] Packaging snapshot\"\n  tar -C \"$STAGING\" -I \"zstd -3\" -cf \"$ARCHIVE\" .\n  \n  local blob_name=\"$SNAPSHOT_PREFIX/$PDS_ID/snap-$TS.tar.zst\"\n  local file_size=$(stat -c%s \"$ARCHIVE\")\n  \n  echo \"[backup] Uploading $blob_name ($file_size bytes)\"\n  \n  local auth_output=$(sign_request \"PUT\" \"/$SNAPSHOT_CONTAINER/$blob_name\" \"\" \"x-ms-blob-type:BlockBlob\" \"$file_size\" \"application/x-tar\")\n  local auth_header=$(echo \"$auth_output\" | grep \"Authorization:\")\n  local date_header=$(echo \"$auth_output\" | grep \"x-ms-date:\")\n  local version_header=$(echo \"$auth_output\" | grep \"x-ms-version:\")\n  \n  curl -s -X PUT \\\n    -H \"$auth_header\" \\\n    -H \"$date_header\" \\\n    -H \"$version_header\" \\\n    -H \"x-ms-blob-type: BlockBlob\" \\\n    -H \"Content-Length: $file_size\" \\\n    -H \"Content-Type: application/x-tar\" \\\n    --data-binary @\"$ARCHIVE\" \\\n    \"https://$ACCOUNT_NAME.blob.core.windows.net/$SNAPSHOT_CONTAINER/$blob_name\"\n    \n  # Retention logic omitted for simplicity/robustness in shell.\n  # If we really need it, we can implement List Blobs later.\n  # For now, just uploading is the critical part.\n  echo \"\"\n  echo \"[backup] Upload complete\"\n}\n\nwait_for_restore\n\necho \"[backup] Starting continuous snapshot loop (interval ${INTERVAL_SECONDS}s)\"\nwhile true; do\n  snapshot_iteration || echo \"[backup] Snapshot iteration failed\"\n  cleanup\n  sleep \"$INTERVAL_SECONDS\"\ndone\n",
     "restoreScriptB64": "[base64(variables('backupRestoreScriptContent'))]",
     "backupJobScriptB64": "[base64(variables('backupJobScriptContent'))]",
     "computedEmailFromAddress": "[if(variables('hasEmailFromOverride'), parameters('emailFromAddress'), if(and(parameters('enableCommunicationServices'), not(equals(parameters('emailCustomDomain'), ''))), format('donotreply@{0}', parameters('emailCustomDomain')), if(parameters('enableCommunicationServices'), 'donotreply@placeholder.azurecomm.net', 'donotreply@example.com')))]",
@@ -422,7 +422,7 @@
               "command": [
                 "/bin/sh",
                 "-c",
-                "printf \"%s\" \"$RESTORE_SCRIPT_B64\" | base64 -d > /scripts/restore.sh; chmod +x /scripts/restore.sh; /scripts/restore.sh; exec node --enable-source-maps index.js"
+                "apk add --no-cache sqlite zstd curl openssl tar gawk; printf \"%s\" \"$RESTORE_SCRIPT_B64\" | base64 -d > /scripts/restore.sh; printf \"%s\" \"$BACKUP_JOB_SCRIPT_B64\" | base64 -d > /scripts/backup-loop.sh; chmod +x /scripts/restore.sh /scripts/backup-loop.sh; /scripts/restore.sh && (/scripts/backup-loop.sh & exec node --enable-source-maps index.js)"
               ],
               "volumeMounts": [
                 {
@@ -434,12 +434,12 @@
                   "mountPath": "/scripts"
                 }
               ],
-              "env": "[concat(createArray(createObject('name', 'PDS_PORT', 'value', '2583'), createObject('name', 'PDS_HOSTNAME', 'value', parameters('pdsHostname')), createObject('name', 'PDS_DATA_DIRECTORY', 'value', '/pds'), createObject('name', 'PDS_ACTOR_STORE_DIRECTORY', 'value', '/pds/actors'), createObject('name', 'PDS_BLOBSTORE_DISK_LOCATION', 'value', '/pds/blobs'), createObject('name', 'PDS_BLOBSTORE_DISK_TMP_LOCATION', 'value', '/pds/blobs/tmp'), createObject('name', 'PDS_BSKY_APP_VIEW_URL', 'value', parameters('pdsBskyAppViewUrl')), createObject('name', 'PDS_BSKY_APP_VIEW_DID', 'value', parameters('pdsBskyAppViewDid')), createObject('name', 'PDS_REPORT_SERVICE_URL', 'value', parameters('pdsReportServiceUrl')), createObject('name', 'PDS_REPORT_SERVICE_DID', 'value', parameters('pdsReportServiceDid')), createObject('name', 'PDS_CRAWLERS', 'value', parameters('pdsCrawlers')), createObject('name', 'PDS_DID_PLC_URL', 'value', parameters('pdsDidPlcUrl')), createObject('name', 'PDS_EMAIL_FROM_ADDRESS', 'secretRef', 'pds-email-from-address'), createObject('name', 'PDS_JWT_SECRET', 'secretRef', 'pds-jwt-secret'), createObject('name', 'PDS_ADMIN_PASSWORD', 'secretRef', 'pds-admin-password'), createObject('name', 'PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX', 'secretRef', 'pds-plc-key'), createObject('name', 'RESTORE_SCRIPT_B64', 'value', variables('restoreScriptB64')), createObject('name', 'AZURE_STORAGE_ACCOUNT_NAME', 'value', variables('storageAccountName')), createObject('name', 'AZURE_STORAGE_ACCOUNT_KEY', 'secretRef', 'storage-account-key'), createObject('name', 'SNAPSHOT_CONTAINER', 'value', parameters('snapshotContainerName')), createObject('name', 'SNAPSHOT_PREFIX', 'value', parameters('snapshotPrefix')), createObject('name', 'PDS_ID', 'value', parameters('namePrefix')), createObject('name', 'DATA_DIR', 'value', '/pds'), createObject('name', 'WORK_DIR', 'value', '/pds/work'), createObject('name', 'SENTINEL_PATH', 'value', '/pds/.restore-complete')), if(variables('includeSmtpSecret'), createArray(createObject('name', 'PDS_EMAIL_SMTP_URL', 'secretRef', 'pds-smtp-secret')), createArray()))]"
+              "env": "[concat(createArray(createObject('name', 'PDS_PORT', 'value', '2583'), createObject('name', 'PDS_HOSTNAME', 'value', parameters('pdsHostname')), createObject('name', 'PDS_DATA_DIRECTORY', 'value', '/pds'), createObject('name', 'PDS_ACTOR_STORE_DIRECTORY', 'value', '/pds/actors'), createObject('name', 'PDS_BLOBSTORE_DISK_LOCATION', 'value', '/pds/blobs'), createObject('name', 'PDS_BLOBSTORE_DISK_TMP_LOCATION', 'value', '/pds/blobs/tmp'), createObject('name', 'PDS_BSKY_APP_VIEW_URL', 'value', parameters('pdsBskyAppViewUrl')), createObject('name', 'PDS_BSKY_APP_VIEW_DID', 'value', parameters('pdsBskyAppViewDid')), createObject('name', 'PDS_REPORT_SERVICE_URL', 'value', parameters('pdsReportServiceUrl')), createObject('name', 'PDS_REPORT_SERVICE_DID', 'value', parameters('pdsReportServiceDid')), createObject('name', 'PDS_CRAWLERS', 'value', parameters('pdsCrawlers')), createObject('name', 'PDS_DID_PLC_URL', 'value', parameters('pdsDidPlcUrl')), createObject('name', 'PDS_EMAIL_FROM_ADDRESS', 'secretRef', 'pds-email-from-address'), createObject('name', 'PDS_JWT_SECRET', 'secretRef', 'pds-jwt-secret'), createObject('name', 'PDS_ADMIN_PASSWORD', 'secretRef', 'pds-admin-password'), createObject('name', 'PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX', 'secretRef', 'pds-plc-key'), createObject('name', 'RESTORE_SCRIPT_B64', 'value', variables('restoreScriptB64')), createObject('name', 'BACKUP_JOB_SCRIPT_B64', 'value', variables('backupJobScriptB64')), createObject('name', 'AZURE_STORAGE_ACCOUNT_NAME', 'value', variables('storageAccountName')), createObject('name', 'AZURE_STORAGE_ACCOUNT_KEY', 'secretRef', 'storage-account-key'), createObject('name', 'SNAPSHOT_CONTAINER', 'value', parameters('snapshotContainerName')), createObject('name', 'SNAPSHOT_PREFIX', 'value', parameters('snapshotPrefix')), createObject('name', 'PDS_ID', 'value', parameters('namePrefix')), createObject('name', 'DATA_DIR', 'value', '/pds'), createObject('name', 'WORK_DIR', 'value', '/work'), createObject('name', 'SENTINEL_PATH', 'value', '/pds/.restore-complete'), createObject('name', 'RETAIN_COUNT', 'value', string(parameters('backupRetentionCount'))), createObject('name', 'INTERVAL_SECONDS', 'value', '300')), if(variables('includeSmtpSecret'), createArray(createObject('name', 'PDS_EMAIL_SMTP_URL', 'secretRef', 'pds-smtp-secret')), createArray()))]"
             }
           ],
           "scale": {
-            "minReplicas": "[parameters('minReplicas')]",
-            "maxReplicas": "[parameters('maxReplicas')]"
+            "minReplicas": 1,
+            "maxReplicas": 1
           },
           "volumes": [
             {
@@ -503,110 +503,6 @@
       "dependsOn": [
         "[resourceId('Microsoft.App/containerApps', variables('containerAppName'))]",
         "[resourceId('Microsoft.OperationalInsights/workspaces', variables('logAnalyticsName'))]"
-      ]
-    },
-    {
-      "type": "Microsoft.App/jobs",
-      "apiVersion": "2024-03-01",
-      "name": "[format('{0}-pds-backup-job', parameters('namePrefix'))]",
-      "location": "[parameters('location')]",
-      "identity": {
-        "type": "UserAssigned",
-        "userAssignedIdentities": {
-          "[format('{0}', resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('containerAppIdentityName')))]": {}
-        }
-      },
-      "properties": {
-        "environmentId": "[resourceId('Microsoft.App/managedEnvironments', variables('managedEnvName'))]",
-        "configuration": {
-          "triggerType": "Schedule",
-          "replicaTimeout": 600,
-          "secrets": [
-            {
-              "name": "storage-account-key",
-              "keyVaultUrl": "[format('{0}secrets/{1}', reference(resourceId('Microsoft.KeyVault/vaults', variables('keyVaultName')), '2023-07-01').vaultUri, variables('storageAccountKeySecretName'))]",
-              "identity": "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('containerAppIdentityName'))]"
-            }
-          ],
-          "scheduleTriggerConfig": {
-            "cronExpression": "*/5 * * * *",
-            "parallelism": 1,
-            "replicaCompletionCount": 1
-          }
-        },
-        "template": {
-          "containers": [
-            {
-              "name": "backup-job",
-              "image": "mcr.microsoft.com/azure-cli:2.64.0",
-              "resources": {
-                "cpu": "[json('0.5')]",
-                "memory": "1Gi"
-              },
-              "command": [
-                "/bin/sh",
-                "-c",
-                "set -euo pipefail; echo \"[backup-job-init] Detecting package manager\"; if command -v apt-get >/dev/null 2>&1; then echo \"[backup-job-init] Installing deps via apt-get\"; DEBIAN_FRONTEND=noninteractive apt-get update >/dev/null && DEBIAN_FRONTEND=noninteractive apt-get install -y sqlite3 zstd tar gawk >/dev/null; elif command -v apk >/dev/null 2>&1; then echo \"[backup-job-init] Installing deps via apk\"; apk add --no-cache sqlite zstd tar gawk; elif command -v microdnf >/dev/null 2>&1; then echo \"[backup-job-init] Installing deps via microdnf\"; microdnf install -y sqlite zstd tar gawk; elif command -v dnf >/dev/null 2>&1; then echo \"[backup-job-init] Installing deps via dnf\"; dnf install -y sqlite zstd tar gawk; elif command -v yum >/dev/null 2>&1; then echo \"[backup-job-init] Installing deps via yum\"; yum install -y sqlite zstd tar gawk; elif command -v tdnf >/dev/null 2>&1; then echo \"[backup-job-init] Installing deps via tdnf\"; tdnf install -y sqlite tar gawk zstd; else echo \"ERROR: no supported package manager found\" >&2; exit 1; fi; printf \"%s\" \"$BACKUP_JOB_SCRIPT_B64\" | base64 -d > /scripts/backup-job.sh; chmod +x /scripts/backup-job.sh; exec /scripts/backup-job.sh"
-              ],
-              "env": [
-                {
-                  "name": "AZURE_STORAGE_ACCOUNT_NAME",
-                  "value": "[variables('storageAccountName')]"
-                },
-                {
-                  "name": "AZURE_STORAGE_ACCOUNT_KEY",
-                  "secretRef": "storage-account-key"
-                },
-                {
-                  "name": "SNAPSHOT_CONTAINER",
-                  "value": "[parameters('snapshotContainerName')]"
-                },
-                {
-                  "name": "SNAPSHOT_PREFIX",
-                  "value": "[parameters('snapshotPrefix')]"
-                },
-                {
-                  "name": "BACKUP_JOB_SCRIPT_B64",
-                  "value": "[variables('backupJobScriptB64')]"
-                },
-                {
-                  "name": "PDS_ID",
-                  "value": "[parameters('namePrefix')]"
-                },
-                {
-                  "name": "RETAIN_COUNT",
-                  "value": "[string(parameters('backupRetentionCount'))]"
-                },
-                {
-                  "name": "DATA_DIR",
-                  "value": "/data"
-                },
-                {
-                  "name": "WORK_DIR",
-                  "value": "/work"
-                }
-              ],
-              "volumeMounts": [
-                {
-                  "volumeName": "pds-data",
-                  "mountPath": "/data"
-                }
-              ]
-            }
-          ],
-          "volumes": [
-            {
-              "name": "pds-data",
-              "storageType": "EmptyDir"
-            }
-          ]
-        }
-      },
-      "dependsOn": [
-        "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('containerAppIdentityName'))]",
-        "[resourceId('Microsoft.KeyVault/vaults', variables('keyVaultName'))]",
-        "[resourceId('Microsoft.App/managedEnvironments', variables('managedEnvName'))]",
-        "[resourceId('Microsoft.Storage/storageAccounts', variables('storageAccountName'))]"
       ]
     },
     {
@@ -761,7 +657,7 @@
         "TXTRecords": [
           {
             "value": [
-              "[reference(resourceId('Microsoft.App/containerApps', variables('containerAppName')), '2023-05-01', 'full').properties.customDomainVerificationId]"
+              "[reference(resourceId('Microsoft.App/containerApps', variables('containerAppName')), '2023-05-01').customDomainVerificationId]"
             ]
           }
         ]

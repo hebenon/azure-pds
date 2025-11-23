@@ -23,10 +23,10 @@ param certificateResourceId string = ''
 param enableCustomDomain bool = false
 
 @description('CPU request for the PDS container in cores.')
-param pdsCpu string = '0.5'
+param pdsCpu string = '0.25'
 
 @description('Memory request for the PDS container.')
-param pdsMemory string = '1Gi'
+param pdsMemory string = '0.5Gi'
 
 @description('Whether to allow unauthenticated HTTP (port 80) alongside HTTPS.')
 param enableHttp bool = true
@@ -160,8 +160,8 @@ var containerAppDependencies = enableCommunicationServices ? [
   managedEnvironment
   storageAccount
 ]
-var backupRestoreScriptContent = loadTextContent('../scripts/pds-backup/restore.sh')
-var backupJobScriptContent = loadTextContent('../scripts/pds-backup/backup-job.sh')
+var backupRestoreScriptContent = loadTextContent('../scripts/pds-backup/restore-curl.sh')
+var backupJobScriptContent = loadTextContent('../scripts/pds-backup/backup-curl.sh')
 var restoreScriptB64 = base64(backupRestoreScriptContent)
 var backupJobScriptB64 = base64(backupJobScriptContent)
 var computedEmailFromAddress = hasEmailFromOverride ? emailFromAddress : enableCommunicationServices && emailCustomDomain != '' ? 'donotreply@${emailCustomDomain}' : enableCommunicationServices ? 'donotreply@placeholder.azurecomm.net' : 'donotreply@example.com'
@@ -326,7 +326,7 @@ resource containerApp 'Microsoft.App/containerApps@2023-05-01' = {
           command: [
             '/bin/sh'
             '-c'
-            'printf "%s" "$RESTORE_SCRIPT_B64" | base64 -d > /scripts/restore.sh; chmod +x /scripts/restore.sh; /scripts/restore.sh; exec node --enable-source-maps index.js'
+            'apk add --no-cache sqlite zstd curl openssl tar gawk; printf "%s" "$RESTORE_SCRIPT_B64" | base64 -d > /scripts/restore.sh; printf "%s" "$BACKUP_JOB_SCRIPT_B64" | base64 -d > /scripts/backup-loop.sh; chmod +x /scripts/restore.sh /scripts/backup-loop.sh; /scripts/restore.sh && (/scripts/backup-loop.sh & exec node --enable-source-maps index.js)'
           ]
           volumeMounts: [
             {
@@ -408,6 +408,10 @@ resource containerApp 'Microsoft.App/containerApps@2023-05-01' = {
               value: restoreScriptB64
             }
             {
+              name: 'BACKUP_JOB_SCRIPT_B64'
+              value: backupJobScriptB64
+            }
+            {
               name: 'AZURE_STORAGE_ACCOUNT_NAME'
               value: storageAccount.name
             }
@@ -433,11 +437,19 @@ resource containerApp 'Microsoft.App/containerApps@2023-05-01' = {
             }
             {
               name: 'WORK_DIR'
-              value: '/pds/work'
+              value: '/work'
             }
             {
               name: 'SENTINEL_PATH'
               value: '/pds/.restore-complete'
+            }
+            {
+              name: 'RETAIN_COUNT'
+              value: string(backupRetentionCount)
+            }
+            {
+              name: 'INTERVAL_SECONDS'
+              value: '300'
             }
           ], includeSmtpSecret ? [
             {
@@ -448,8 +460,8 @@ resource containerApp 'Microsoft.App/containerApps@2023-05-01' = {
         }
       ]
       scale: {
-        minReplicas: minReplicas
-        maxReplicas: maxReplicas
+        minReplicas: 1
+        maxReplicas: 1
       }
       volumes: [
         {
@@ -499,103 +511,6 @@ resource containerAppDiagnostics 'Microsoft.Insights/diagnosticSettings@2021-05-
         enabled: true
       }
     ]
-  }
-}
-
-resource backupJob 'Microsoft.App/jobs@2024-03-01' = {
-  name: '${namePrefix}-pds-backup-job'
-  location: location
-  identity: {
-    type: 'UserAssigned'
-    userAssignedIdentities: {
-      '${containerAppIdentity.id}': {}
-    }
-  }
-  properties: {
-    environmentId: managedEnvironment.id
-    configuration: {
-      triggerType: 'Schedule'
-      replicaTimeout: 600
-      secrets: [
-        {
-          name: 'storage-account-key'
-          keyVaultUrl: '${keyVault.properties.vaultUri}secrets/${storageAccountKeySecretName}'
-          identity: containerAppIdentity.id
-        }
-      ]
-      scheduleTriggerConfig: {
-        cronExpression: '*/5 * * * *'
-        parallelism: 1
-        replicaCompletionCount: 1
-      }
-    }
-    template: {
-      containers: [
-        {
-          name: 'backup-job'
-          image: 'mcr.microsoft.com/azure-cli:2.64.0'
-          resources: {
-            cpu: json('0.5')
-            memory: '1Gi'
-          }
-          command: [
-            '/bin/sh'
-            '-c'
-            'set -euo pipefail; echo "[backup-job-init] Detecting package manager"; if command -v apt-get >/dev/null 2>&1; then echo "[backup-job-init] Installing deps via apt-get"; DEBIAN_FRONTEND=noninteractive apt-get update >/dev/null && DEBIAN_FRONTEND=noninteractive apt-get install -y sqlite3 zstd tar gawk >/dev/null; elif command -v apk >/dev/null 2>&1; then echo "[backup-job-init] Installing deps via apk"; apk add --no-cache sqlite zstd tar gawk; elif command -v microdnf >/dev/null 2>&1; then echo "[backup-job-init] Installing deps via microdnf"; microdnf install -y sqlite zstd tar gawk; elif command -v dnf >/dev/null 2>&1; then echo "[backup-job-init] Installing deps via dnf"; dnf install -y sqlite zstd tar gawk; elif command -v yum >/dev/null 2>&1; then echo "[backup-job-init] Installing deps via yum"; yum install -y sqlite zstd tar gawk; elif command -v tdnf >/dev/null 2>&1; then echo "[backup-job-init] Installing deps via tdnf"; tdnf install -y sqlite tar gawk zstd; else echo "ERROR: no supported package manager found" >&2; exit 1; fi; printf "%s" "$BACKUP_JOB_SCRIPT_B64" | base64 -d > /scripts/backup-job.sh; chmod +x /scripts/backup-job.sh; exec /scripts/backup-job.sh'
-          ]
-          env: [
-            {
-              name: 'AZURE_STORAGE_ACCOUNT_NAME'
-              value: storageAccount.name
-            }
-            {
-              name: 'AZURE_STORAGE_ACCOUNT_KEY'
-              secretRef: 'storage-account-key'
-            }
-            {
-              name: 'SNAPSHOT_CONTAINER'
-              value: snapshotContainerName
-            }
-            {
-              name: 'SNAPSHOT_PREFIX'
-              value: snapshotPrefix
-            }
-            {
-              name: 'BACKUP_JOB_SCRIPT_B64'
-              value: backupJobScriptB64
-            }
-            {
-              name: 'PDS_ID'
-              value: namePrefix
-            }
-            {
-              name: 'RETAIN_COUNT'
-              value: string(backupRetentionCount)
-            }
-            {
-              name: 'DATA_DIR'
-              value: '/data'
-            }
-            {
-              name: 'WORK_DIR'
-              value: '/work'
-            }
-          ]
-          volumeMounts: [
-            {
-              volumeName: 'pds-data'
-              mountPath: '/data'
-            }
-          ]
-        }
-      ]
-      volumes: [
-        {
-          name: 'pds-data'
-          storageType: 'EmptyDir'
-        }
-      ]
-    }
   }
 }
 
@@ -708,7 +623,7 @@ resource dnsVerificationRecord 'Microsoft.Network/dnsZones/TXT@2023-07-01-previe
     TXTRecords: [
       {
         value: [
-          reference(containerApp.id, '2023-05-01', 'full').properties.customDomainVerificationId
+          containerApp.properties.customDomainVerificationId
         ]
       }
     ]
