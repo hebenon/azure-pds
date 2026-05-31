@@ -56,49 +56,91 @@ sign_request() {
   echo "x-ms-version: $version"
 }
 
+# List Blobs function with pagination
+list_blobs() {
+  local marker="$1"
+  local blobs_file="$2"
+  
+  local query_params="comp:list\nprefix:$SNAP_PREFIX\nrestype:container"
+  local url_params="restype=container&comp=list&prefix=$SNAP_PREFIX"
+  
+  if [ -n "$marker" ]; then
+    # Insert marker alphabetically: comp, marker, prefix, restype
+    query_params="comp:list\nmarker:$marker\nprefix:$SNAP_PREFIX\nrestype:container"
+    url_params="$url_params&marker=$marker"
+  fi
+
+  local auth_output=$(sign_request "GET" "/$SNAPSHOT_CONTAINER" "$query_params" "")
+  local auth_header=$(echo "$auth_output" | grep "Authorization:")
+  local date_header=$(echo "$auth_output" | grep "x-ms-date:")
+  local version_header=$(echo "$auth_output" | grep "x-ms-version:")
+  
+  local list_url="https://$ACCOUNT_NAME.blob.core.windows.net/$SNAPSHOT_CONTAINER?$url_params"
+
+  local response_body_file=$(mktemp)
+  local http_code=$(curl -s -w "%{http_code}" -X GET \
+    -H "$auth_header" \
+    -H "$date_header" \
+    -H "$version_header" \
+    -o "$response_body_file" \
+    "$list_url")
+
+  if [ "$http_code" != "200" ]; then
+    echo "[restore] ERROR: Failed to list blobs. HTTP Status: $http_code"
+    cat "$response_body_file"
+    rm -f "$response_body_file"
+    return 1
+  fi
+  
+  # Extract names and append to blobs file
+  cat "$response_body_file" | grep -o '<Name>[^<]*</Name>' | sed 's/<Name>\(.*\)<\/Name>/\1/' >> "$blobs_file"
+  
+  # Check for NextMarker
+  local next_marker=$(cat "$response_body_file" | grep -o '<NextMarker>[^<]*</NextMarker>' | sed 's/<NextMarker>\(.*\)<\/NextMarker>/\1/')
+  rm -f "$response_body_file"
+  
+  if [ -n "$next_marker" ]; then
+    echo "$next_marker"
+  fi
+}
+
 echo "[restore] Looking for latest snapshot in container '$SNAPSHOT_CONTAINER' with prefix '$SNAPSHOT_PREFIX/$PDS_ID'"
 
-# List Blobs
-# CanonicalizedResource: /account/container\ncomp:list\nprefix:...\nrestype:container
-prefix="$SNAPSHOT_PREFIX/$PDS_ID/"
-query_params="comp:list\nprefix:$prefix\nrestype:container"
-auth_output=$(sign_request "GET" "/$SNAPSHOT_CONTAINER" "$query_params" "")
-auth_header=$(echo "$auth_output" | grep "Authorization:")
-date_header=$(echo "$auth_output" | grep "x-ms-date:")
-version_header=$(echo "$auth_output" | grep "x-ms-version:")
+SNAP_PREFIX="$SNAPSHOT_PREFIX/$PDS_ID/"
+ALL_BLOBS_FILE=$(mktemp)
+NEXT_MARKER=""
 
-list_url="https://$ACCOUNT_NAME.blob.core.windows.net/$SNAPSHOT_CONTAINER?restype=container&comp=list&prefix=$prefix"
+# Pagination Loop
+while true; do
+  # Capture output to get next marker (last line)
+  RESULT=$(list_blobs "$NEXT_MARKER" "$ALL_BLOBS_FILE")
+  RET=$?
+  if [ $RET -ne 0 ]; then
+     echo "[restore] Listing failed."
+     exit 1
+  fi
+  
+  # The function prints NextMarker to stdout if it exists
+  NEW_MARKER=$(echo "$RESULT" | tail -n 1)
+  
+  # If list_blobs echoed nothing (or just the error logs redirected?), then marker is empty
+  # Actually, list_blobs echoes marker.
+  # We need to be careful not to capture other output if we put echoes in the function.
+  # I moved non-error echoes out of function or to stderr.
+  
+  if [ -z "$NEW_MARKER" ] || [ "$NEW_MARKER" = "$NEXT_MARKER" ]; then
+    break
+  fi
+  
+  NEXT_MARKER="$NEW_MARKER"
+  echo "[restore] Fetching next page (marker: $NEXT_MARKER)..."
+done
 
-# Capture HTTP status code and body
-# We use a temporary file for the body to avoid pipe masking exit codes and to separate body from status
-response_body_file=$(mktemp)
-http_code=$(curl -s -w "%{http_code}" -X GET \
-  -H "$auth_header" \
-  -H "$date_header" \
-  -H "$version_header" \
-  -o "$response_body_file" \
-  "$list_url")
-
-if [ "$http_code" != "200" ]; then
-  echo "[restore] ERROR: Failed to list blobs. HTTP Status: $http_code"
-  echo "[restore] Response body:"
-  cat "$response_body_file"
-  rm -f "$response_body_file"
-  exit 1
-fi
-
-list_response=$(cat "$response_body_file")
-rm -f "$response_body_file"
-
-# Extract latest blob
-# Note: Alpine grep doesn't support -P, so we use sed
-LATEST_BLOB=$(echo "$list_response" | sed -n 's/.*<Name>\(.*\)<\/Name>.*/\1/p' | grep "$SNAPSHOT_PREFIX/$PDS_ID/" | sort | tail -1 || true)
+LATEST_BLOB=$(grep "$SNAP_PREFIX" "$ALL_BLOBS_FILE" | sort | tail -1)
+rm -f "$ALL_BLOBS_FILE"
 
 if [ -z "${LATEST_BLOB:-}" ]; then
-  # Check if the response was actually a valid empty list (contains <Blobs /> or <Blobs></Blobs> or just <Blobs>)
-  # If it's a valid XML response but no blobs match, that's fine.
-  # But if we got 200 OK, it should be valid XML.
-  echo "[restore] No snapshots found matching prefix '$SNAPSHOT_PREFIX/$PDS_ID/'; starting with empty state."
+  echo "[restore] No snapshots found matching prefix '$SNAP_PREFIX'; starting with empty state."
   touch "$SENTINEL_PATH"
   exit 0
 fi
