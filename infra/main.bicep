@@ -326,7 +326,7 @@ resource containerApp 'Microsoft.App/containerApps@2023-05-01' = {
           command: [
             '/bin/sh'
             '-c'
-            'apk add --no-cache sqlite zstd curl openssl tar gawk; printf "%s" "$RESTORE_SCRIPT_B64" | base64 -d > /scripts/restore.sh; printf "%s" "$BACKUP_JOB_SCRIPT_B64" | base64 -d > /scripts/backup-loop.sh; chmod +x /scripts/restore.sh /scripts/backup-loop.sh; /scripts/restore.sh && (/scripts/backup-loop.sh & exec node --enable-source-maps index.js)'
+            'apk add --no-cache sqlite zstd curl openssl tar gawk; printf "%s" "$RESTORE_SCRIPT_B64" | base64 -d > /scripts/restore.sh; printf "%s" "$BACKUP_JOB_SCRIPT_B64" | base64 -d > /scripts/backup-loop.sh; chmod +x /scripts/restore.sh /scripts/backup-loop.sh; /scripts/restore.sh && (/scripts/backup-loop.sh & PDS_ENTRY=index.ts; [ -f "$PDS_ENTRY" ] || PDS_ENTRY=index.js; exec node --enable-source-maps "$PDS_ENTRY")'
           ]
           volumeMounts: [
             {
