@@ -123,6 +123,9 @@ param pdsReportServiceDid string = 'did:plc:ar7c4by46qjdydhdevvrndac'
 @description('Crawlers to whitelist for indexing (comma-separated URLs).')
 param pdsCrawlers string = 'https://bsky.network'
 
+@description('Timestamp used to force a new revision on deployment.')
+param configTimestamp string = utcNow()
+
 var tenantId = subscription().tenantId
 var pdsImage = 'ghcr.io/bluesky-social/pds:${pdsImageTag}'
 var cleanedNamePrefix = replace('${namePrefix}${uniqueString(resourceGroup().id)}', '-', '')
@@ -271,7 +274,7 @@ resource containerApp 'Microsoft.App/containerApps@2023-05-01' = {
         external: true
         targetPort: 2583
         allowInsecure: enableHttp
-        transport: 'auto'
+        transport: 'http'
         traffic: [
           {
             latestRevision: true
@@ -450,6 +453,18 @@ resource containerApp 'Microsoft.App/containerApps@2023-05-01' = {
             {
               name: 'INTERVAL_SECONDS'
               value: '300'
+            }
+            {
+              name: 'REVISION_DATE'
+              value: configTimestamp
+            }
+            {
+              name: 'LOG_ENABLED'
+              value: 'true'
+            }
+            {
+              name: 'LOG_LEVEL'
+              value: 'info'
             }
           ], includeSmtpSecret ? [
             {

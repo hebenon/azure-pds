@@ -17,7 +17,16 @@ mkdir -p "$WORK_DIR"
 cleanup() {
   rm -rf "$WORK_DIR"/snapshot-* "$WORK_DIR"/archive-*.tar.zst 2>/dev/null || true
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+
+shutdown_handler() {
+  echo "[backup] Caught shutdown signal! Performing final snapshot..."
+  snapshot_iteration
+  cleanup
+  exit 0
+}
+
+trap shutdown_handler INT TERM
 
 wait_for_restore() {
   while [ ! -f "$SENTINEL_PATH" ]; do
